@@ -1,5 +1,6 @@
 *.csv
 __MACOSX/
+final project/images/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
