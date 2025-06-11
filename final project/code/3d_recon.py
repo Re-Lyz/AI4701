@@ -1,428 +1,303 @@
-#!/usr/bin/env python3
-"""
-三维重建主程序
-使用特征提取和匹配模块进行三维重建的完整流程
-"""
-
 import os
 import sys
-import numpy as np
-from typing import List, Tuple, Dict
 import time
+import numpy as np
+from typing import List, Dict, Any
+from scipy.spatial.transform import Rotation as R_scipy
+import open3d as o3d
 
-# 导入自定义模块
-try:
-    from feature_extraction import (
-        extract_features_from_images, 
-        display_keypoints_for_images,
-        save_features_to_file
-    )
-    from feature_matching import (
-        match_image_pairs,
-        display_matches_for_pairs,
-        filter_matches_by_homography
-    )
-except ImportError as e:
-    print(f"Error importing modules: {e}")
-    print("Make sure feature_extraction.py and feature_matching.py are in the same directory")
-    sys.exit(1)
+from feature_extraction import extract_features_from_images
+from feature_matching import match_image_pairs, match_sift_features, filter_matches_by_homography
+from initial_recon import estimate_pose, print_pose_info
+from pnp_recon import pnp_pose, triangulate_initial_points, visualize_with_open3d, triangulate_points, filter_matches_by_fundamental
+from bundle_adjustment import BundleAdjustment
 
-class ThreeDReconstruction:
-    """三维重建主类"""
-    
-    def __init__(self, image_directory: str = None, image_paths: List[str] = None):
-        """
-        初始化三维重建系统
-        
-        Args:
-            image_directory: 包含图片的目录路径
-            image_paths: 图片路径列表（二选一）
-        """
+class ReconstructionPipeline:
+    def __init__(
+        self,
+        image_folder: str,
+        camera_intrinsics: str ,
+        output_dir: str = 'output',
+        feature_extractor: bool = True,
+        feature_matcher: bool = True,
+        initial_pose_estimator: bool = True,
+        pnp_estimator: bool = True,
+        bundle_adjustment: bool = True
+    ):
+        self.image_folder = image_folder
+        self.camera_intrinsics = camera_intrinsics
+        self.output_dir = output_dir
+        self.feature_extractor = feature_extractor
+        self.feature_matcher = feature_matcher
+        self.initial_pose_estimator = initial_pose_estimator
+        self.pnp_estimator = pnp_estimator
+        self.bundle_adjustment = bundle_adjustment
+
+        # Gather image paths
         self.image_paths = []
-        self.feature_data = []
-        self.matches_data = []
-        self.method = 'sift'  # 默认使用SIFT
-        
-        if image_directory:
-            self.load_images_from_directory(image_directory)
-        elif image_paths:
-            self.image_paths = image_paths
-        else:
-            print("Warning: No images provided. Use load_images_from_directory() or set_image_paths()")
-    
-    def load_images_from_directory(self, directory: str, extensions: List[str] = None):
-        """
-        从目录加载图片
-        
-        Args:
-            directory: 图片目录路径
-            extensions: 支持的图片扩展名
-        """
-        if extensions is None:
-            extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
-        
-        if not os.path.exists(directory):
-            print(f"Error: Directory {directory} does not exist!")
-            return
-        
-        self.image_paths = []
-        for filename in sorted(os.listdir(directory)):
-            if any(filename.lower().endswith(ext) for ext in extensions):
-                self.image_paths.append(os.path.join(directory, filename))
-        
-        print(f"Loaded {len(self.image_paths)} images from {directory}")
-        for i, path in enumerate(self.image_paths):
-            print(f"  {i+1}: {os.path.basename(path)}")
-    
-    def set_image_paths(self, image_paths: List[str]):
-        """设置图片路径列表"""
-        self.image_paths = image_paths
-        print(f"Set {len(self.image_paths)} image paths")
-    
-    def set_feature_method(self, method: str):
-        """
-        设置特征提取方法
-        
-        Args:
-            method: 'sift' 或 'orb'
-        """
-        if method.lower() in ['sift', 'orb']:
-            self.method = method.lower()
-            print(f"Feature extraction method set to: {self.method.upper()}")
-        else:
-            print(f"Unknown method: {method}. Using SIFT as default.")
-            self.method = 'sift'
-    
-    def extract_features(self, display_keypoints: bool = True, max_display_images: int = 5):
-        """
-        步骤1：提取所有图片的特征
-        
-        Args:
-            display_keypoints: 是否显示关键点
-            max_display_images: 最多显示几张图片的关键点
-        """
-        print("\n" + "="*60)
-        print("STEP 1: FEATURE EXTRACTION")
-        print("="*60)
-        
+        for root, dirs, files in os.walk(image_folder):
+            self.image_paths = [os.path.join(root, f) for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            if self.image_paths:
+                break
         if not self.image_paths:
-            print("Error: No images loaded!")
-            return False
-        
-        start_time = time.time()
-        
-        # 提取特征
-        self.feature_data = extract_features_from_images(self.image_paths, method=self.method)
-        
-        # 检查提取结果
-        valid_features = sum(1 for _, desc in self.feature_data if desc is not None)
-        print(f"\nFeature extraction completed in {time.time() - start_time:.2f} seconds")
-        print(f"Valid features extracted from {valid_features}/{len(self.image_paths)} images")
-        
-        if valid_features < 2:
-            print("Error: Need at least 2 images with valid features for matching!")
-            return False
-        
-        # 显示关键点（如果需要）
-        if display_keypoints:
-            display_keypoints_for_images(
-                self.image_paths, 
-                self.feature_data, 
-                max_images=max_display_images, 
-                save_visualizations=True
-            )
-        
-        # 保存特征到文件
-        save_features_to_file(self.feature_data, self.image_paths, f"{self.method}_features")
-        
-        return True
-    
-    def match_features(self, display_matches: bool = True, max_display_pairs: int = 3):
-        """
-        步骤2：匹配图片间的特征
-        
-        Args:
-            display_matches: 是否显示匹配结果
-            max_display_pairs: 最多显示几对图片的匹配
-        """
-        print("\n" + "="*60)
-        print("STEP 2: FEATURE MATCHING")
-        print("="*60)
-        
-        if not self.feature_data:
-            print("Error: No features extracted! Run extract_features() first.")
-            return False
-        
-        start_time = time.time()
-        
-        # 进行特征匹配
-        self.matches_data = match_image_pairs(self.feature_data, method=self.method)
-        
-        # 统计匹配结果
-        total_pairs = 0
-        successful_pairs = 0
-        total_matches = 0
-        
-        for i in range(len(self.image_paths)):
-            for j in range(i+1, len(self.image_paths)):
-                total_pairs += 1
-                if i < len(self.matches_data) and j < len(self.matches_data[i]):
-                    matches = self.matches_data[i][j]
-                    if matches:
-                        successful_pairs += 1
-                        total_matches += len(matches)
-        
-        print(f"\nFeature matching completed in {time.time() - start_time:.2f} seconds")
-        print(f"Successful matching pairs: {successful_pairs}/{total_pairs}")
-        print(f"Total matches found: {total_matches}")
-        
-        # 显示匹配结果（如果需要）
-        if display_matches and successful_pairs > 0:
-            display_matches_for_pairs(
-                self.image_paths, 
-                self.feature_data, 
-                self.matches_data, 
-                max_pairs=max_display_pairs, 
-                method=self.method
-            )
-        
-        return True
-    
-    def filter_matches_with_homography(self, min_matches: int = 10):
-        """
-        步骤3：使用单应性矩阵过滤匹配点
-        
-        Args:
-            min_matches: 最少匹配点数量
-        """
-        print("\n" + "="*60)
-        print("STEP 3: HOMOGRAPHY FILTERING")
-        print("="*60)
-        
-        if not self.matches_data:
-            print("Error: No matches found! Run match_features() first.")
-            return False
-        
-        filtered_matches = []
-        homographies = []
-        
-        for i in range(len(self.image_paths)):
-            filtered_row = []
-            homography_row = []
-            
-            for j in range(len(self.image_paths)):
-                if i == j:
-                    filtered_row.append([])
-                    homography_row.append(None)
-                    continue
-                
-                if i < len(self.matches_data) and j < len(self.matches_data[i]):
-                    matches = self.matches_data[i][j]
-                    
-                    if len(matches) >= min_matches:
-                        kp1, _ = self.feature_data[i]
-                        kp2, _ = self.feature_data[j]
-                        
-                        filtered, homography = filter_matches_by_homography(kp1, kp2, matches)
-                        filtered_row.append(filtered)
-                        homography_row.append(homography)
-                        
-                        if filtered:
-                            print(f"Pair ({i+1}, {j+1}): {len(filtered)}/{len(matches)} matches after filtering")
-                    else:
-                        filtered_row.append([])
-                        homography_row.append(None)
-                else:
-                    filtered_row.append([])
-                    homography_row.append(None)
-            
-            filtered_matches.append(filtered_row)
-            homographies.append(homography_row)
-        
-        # 更新匹配数据
-        self.matches_data = filtered_matches
-        self.homographies = homographies
-        
-        return True
-    
-    def get_match_statistics(self):
-        """获取匹配统计信息"""
-        if not self.matches_data:
-            return None
-        
-        stats = {
-            'total_images': len(self.image_paths),
-            'total_pairs': 0,
-            'successful_pairs': 0,
-            'total_matches': 0,
-            'avg_matches_per_pair': 0,
-            'pair_details': []
-        }
-        
-        for i in range(len(self.image_paths)):
-            for j in range(i+1, len(self.image_paths)):
-                stats['total_pairs'] += 1
-                
-                if i < len(self.matches_data) and j < len(self.matches_data[i]):
-                    matches = self.matches_data[i][j]
-                    if matches:
-                        stats['successful_pairs'] += 1
-                        stats['total_matches'] += len(matches)
-                        stats['pair_details'].append({
-                            'pair': (i+1, j+1),
-                            'matches': len(matches),
-                            'images': (os.path.basename(self.image_paths[i]), 
-                                     os.path.basename(self.image_paths[j]))
-                        })
-        
-        if stats['successful_pairs'] > 0:
-            stats['avg_matches_per_pair'] = stats['total_matches'] / stats['successful_pairs']
-        
-        return stats
-    
-    def print_summary(self):
-        """打印处理结果摘要"""
-        print("\n" + "="*60)
-        print("PROCESSING SUMMARY")
-        print("="*60)
-        
-        print(f"Total images processed: {len(self.image_paths)}")
-        print(f"Feature extraction method: {self.method.upper()}")
-        
-        # 特征提取统计
-        if self.feature_data:
-            valid_features = sum(1 for _, desc in self.feature_data if desc is not None)
-            print(f"Images with valid features: {valid_features}/{len(self.image_paths)}")
-            
-            for i, (kp, desc) in enumerate(self.feature_data):
-                if desc is not None:
-                    print(f"  Image {i+1}: {len(kp)} keypoints")
-        
-        # 匹配统计
-        stats = self.get_match_statistics()
-        if stats:
-            print(f"\nMatching results:")
-            print(f"  Successful pairs: {stats['successful_pairs']}/{stats['total_pairs']}")
-            print(f"  Total matches: {stats['total_matches']}")
-            print(f"  Average matches per pair: {stats['avg_matches_per_pair']:.1f}")
-            
-            if stats['pair_details']:
-                print(f"\nTop matching pairs:")
-                sorted_pairs = sorted(stats['pair_details'], key=lambda x: x['matches'], reverse=True)
-                for pair_info in sorted_pairs[:5]:  # 显示前5个最佳匹配对
-                    print(f"  Pair {pair_info['pair']}: {pair_info['matches']} matches "
-                          f"({pair_info['images'][0]} ↔ {pair_info['images'][1]})")
-    
-    def run_full_pipeline(self, display_keypoints: bool = True, display_matches: bool = True,
-                         max_display_images: int = 5, max_display_pairs: int = 3,
-                         use_homography_filtering: bool = True):
-        """
-        运行完整的特征提取和匹配流程
-        
-        Args:
-            display_keypoints: 是否显示关键点
-            display_matches: 是否显示匹配结果
-            max_display_images: 最多显示几张图片的关键点
-            max_display_pairs: 最多显示几对图片的匹配
-            use_homography_filtering: 是否使用单应性过滤
-        """
-        print("Starting 3D Reconstruction Pipeline...")
-        print(f"Processing {len(self.image_paths)} images using {self.method.upper()} features")
-        
-        total_start_time = time.time()
-        
-        # 步骤1：特征提取
-        if not self.extract_features(display_keypoints, max_display_images):
-            print("Feature extraction failed!")
-            return False
-        
-        # 步骤2：特征匹配
-        if not self.match_features(display_matches, max_display_pairs):
-            print("Feature matching failed!")
-            return False
-        
-        # 步骤3：单应性过滤（可选）
-        if use_homography_filtering:
-            self.filter_matches_with_homography()
-        
-        total_time = time.time() - total_start_time
-        print(f"\nPipeline completed in {total_time:.2f} seconds")
-        
-        # 打印摘要
-        self.print_summary()
-        
-        return True
+            raise FileNotFoundError(f"No images found in folder: {image_folder}")
 
-def main():
-    """主函数 - 使用示例"""
-    print("=== 3D Reconstruction Pipeline ===")
-    
-    # 方法1：从目录加载图片
-    # reconstruction = ThreeDReconstruction(image_directory="./images")
-    
-    # 方法2：指定图片路径列表
-    image_paths = [
-        "images/DJI_20200223_163016_842.jpg",
-        "images/DJI_20200223_163017_967.jpg",
-        "images/DJI_20200223_163018_942.jpg"
-        
-    ]
-    
-    # 检查图片是否存在，如果不存在则创建测试图片
-    import cv2
-    for i, path in enumerate(image_paths):
-        if not os.path.exists(path):
-            print(f"Creating test image: {path}")
-            # 创建带有不同特征的测试图片
-            img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        # Load camera intrinsics
+        k_path = self.camera_intrinsics
+        if not os.path.exists(k_path):
+            raise FileNotFoundError(f"找不到相机内参文件：{k_path}")
+        self.K = np.loadtxt(k_path, dtype=np.float32)
+        if self.K.shape != (3, 3):
+            raise ValueError(f"相机内参矩阵形状不正确，应为3x3，但得到 {self.K.shape}")
+
+        # Placeholders
+        self.features: List[Any] = []
+        self.matches: List[Any] = []
+        self.poses: List[Dict[str, Any]] = []
+        self.points_3d: np.ndarray = None
+        self.point_observations: Dict[int, Dict[int, tuple]] = {}
+
+    def run(self):
+        start_time = time.time()
+
+        # 1. Feature Extraction
+        if self.feature_extractor:
+            print("Extracting features from images...")
+            self.features = extract_features_from_images(self.image_paths, method='sift')
+
+        # 2. Feature Matching
+        if self.feature_matcher:
+            print("Matching features between image pairs...")
+            # 1. 特征提取后，直接拿到所有对的 matches
+            all_matches = match_image_pairs(self.features, method='sift')
             
-            # 添加一些共同特征
-            cv2.rectangle(img, (100, 100), (200, 200), (255, 255, 255), -1)
-            cv2.circle(img, (300, 200), 40, (0, 0, 255), -1)
-            cv2.line(img, (50, 300), (550, 300), (0, 255, 0), 3)
+            # 2. 把满足阈值的那几对挑出来，构造 self.matches
+            self.matches = []
+            n = len(self.features)
+            for i in range(n):
+                for j in range(i+1, n):
+                    matches_ij = all_matches[i][j]
+                    if len(matches_ij) >= 4:
+                        self.matches.append((i, j, matches_ij))
+
+        # 3. Initial Pose Estimation
+        if self.initial_pose_estimator and self.matches:
+            print("Estimating initial pose from first image pair...")
+            i, j, raw_matches = self.matches[0]
+            kp1, _ = self.features[i]
+            kp2, _ = self.features[j]
+            filtered, H = filter_matches_by_homography(kp1, kp2, raw_matches)
+            if len(filtered) < 4:
+                raise RuntimeError("Homography inliers too few for initial pose estimation.")
+            R, t, mask_pose, E, inliers = estimate_pose(filtered, kp1, kp2, self.K)
+            self.poses = [
+                {'R': np.eye(3), 't': np.zeros((3,1)), 'inliers': None, 'pair': (None, 0)},
+                {'R': R, 't': t, 'inliers': inliers, 'pair': (i, j)}
+            ]
+            print_pose_info(R, t, len(filtered), len(inliers))
+
+        # 4. PnP Pose Estimation and Triangulation
+        if self.pnp_estimator and len(self.poses) >= 2:
+            print("Triangulating initial 3D points...")
+            first = self.poses[1]
+            i, j = first['pair']
+            kp1, _ = self.features[i]
+            kp2, _ = self.features[j]
+            initial_pts3d, valid_indices = triangulate_initial_points(
+                first['inliers'], kp1, kp2, self.K, first['R'], first['t']
+            )
+            self.points_3d = initial_pts3d
+            for idx_pt, match_idx in enumerate(valid_indices):
+                m = first['inliers'][match_idx]
+                pt0 = kp1[m.queryIdx].pt
+                pt1 = kp2[m.trainIdx].pt
+                self.point_observations[idx_pt] = {0: pt0, 1: pt1}
+
+            for img_idx in range(2, len(self.image_paths)):
+                print(f"\nProcessing PnP for image {img_idx}...")
+                # 1) PnP 求解新相机外参
+                kp_new, desc_new = self.features[img_idx]
+                kp0, desc0 = self.features[0]
+                matches_0_i = match_sift_features(desc0, desc_new)
+                img_pts, obj_pts = [], []
+                for m in matches_0_i:
+                    # 遍历已有三维点的观测，找到 queryIdx 对应的 3D 点
+                    for pt3d_idx, obs in self.point_observations.items():
+                        if 0 in obs:
+                            # obs[0] 是第0张图里该点的像素坐标
+                            if np.linalg.norm(np.array(obs[0]) - np.array(kp0[m.queryIdx].pt)) < 1e-3:
+                                # kp_new[m.trainIdx] 是新图里对应的像素坐标
+                                img_pts.append(kp_new[m.trainIdx].pt)
+                                # self.points_3d[pt3d_idx] 是这条 track 对应的 3D 坐标
+                                obj_pts.append(self.points_3d[pt3d_idx])
+                                break
+                R_new, t_new, inliers_new = pnp_pose(img_pts, obj_pts, self.K)
+                self.poses.append({'R': R_new, 't': t_new, 'inliers': inliers_new, 'pair': (0, img_idx)})
+                print(f"  - PnP: {len(inliers_new)}/{len(obj_pts)} inliers")
+
+                # 2) **增量三角化**：new_idx 与所有 prev_idx 做 matching → 基础矩阵滤外点 → 三角化
+                for prev_idx in range(0, img_idx):
+                    kp_prev, desc_prev = self.features[prev_idx]
+                    # 2.1 匹配
+                    matches_pi = match_sift_features(desc_prev, desc_new)
+                    # 2.2 用基础矩阵 RANSAC 去除外点（你需要实现 filter_matches_by_fundamental）
+                    inliers_pi, F = filter_matches_by_fundamental(kp_prev, kp_new, matches_pi)
+                    if len(inliers_pi) < 8:
+                        continue
+                    # 2.3 三角化
+                    R_prev, t_prev = self.poses[prev_idx]['R'], self.poses[prev_idx]['t']
+                    new_pts3d, new_indices = triangulate_points(
+                        inliers_pi, kp_prev, kp_new,
+                        self.K, R_prev, t_prev, R_new, t_new
+                    )
+                    # 2.4 将新点累加进全局点云，更新自观测字典
+                    base_idx = len(self.points_3d)
+                    self.points_3d = np.vstack([self.points_3d, new_pts3d])
+                    for local_i, pt_idx in enumerate(new_indices):
+                        global_i = base_idx + local_i
+                        m = inliers_pi[pt_idx]
+                        pt_prev = kp_prev[m.queryIdx].pt
+                        pt_new  = kp_new[m.trainIdx].pt
+                        self.point_observations[global_i] = {
+                            prev_idx: pt_prev,
+                            img_idx:  pt_new
+                        }
+                                       
+        camera_matrices_to_save = []
+        for pose in self.poses:
+            T = np.eye(4, dtype=np.float64)
+            T[:3, :3] = pose['R']
+            T[:3,  3] = pose['t'].reshape(3,)
+            camera_matrices_to_save.append(T)
             
-            # 添加一些独特特征
-            cv2.rectangle(img, (50+i*80, 50), (100+i*80, 100), (255, 0, 255), -1)
-            cv2.circle(img, (400+i*30, 350), 25, (255, 255, 0), -1)
-            
-            # 添加一些噪声点
-            for _ in range(20):
-                x, y = np.random.randint(0, 640), np.random.randint(0, 480)
-                cv2.circle(img, (x, y), 5, (np.random.randint(0, 255), 
-                                           np.random.randint(0, 255), 
-                                           np.random.randint(0, 255)), -1)
-            
-            cv2.imwrite(path, img)
-    
-    # 创建重建对象
-    reconstruction = ThreeDReconstruction(image_paths=image_paths)
-    
-    # 设置特征提取方法
-    reconstruction.set_feature_method('sift')  # 或 'orb'
-    
-    # 运行完整流程
-    success = reconstruction.run_full_pipeline(
-        display_keypoints=True,      # 显示关键点
-        display_matches=True,        # 显示匹配结果
-        max_display_images=3,        # 最多显示3张图片的关键点
-        max_display_pairs=3,         # 最多显示3对图片的匹配
-        use_homography_filtering=True # 使用单应性过滤
-    )
-    
-    if success:
-        print("\n=== Pipeline completed successfully! ===")
-        print("Generated files:")
-        print("- keypoints_*.jpg: Keypoint visualizations")
-        print("- matches_*.jpg: Match visualizations")
-        print("- *_features/: Saved feature data")
-    else:
-        print("\n=== Pipeline failed! ===")
-    
-    # 也可以分步骤运行
-    # reconstruction.extract_features(display_keypoints=True)
-    # reconstruction.match_features(display_matches=True)
-    # reconstruction.filter_matches_with_homography()
-    # reconstruction.print_summary()
+        # 5. Bundle Adjustment
+        if self.bundle_adjustment:
+            print("Running bundle adjustment...")
+
+            # 5.1 将 self.poses 转为 4x4 矩阵列表
+            camera_matrices = []
+            for pose in self.poses:
+                T = np.eye(4, dtype=np.float64)
+                T[:3, :3] = pose['R']
+                # 如果 t 的形状是 (3,1) 或 (3,)
+                t_vec = pose['t'].reshape(3,)
+                T[:3, 3] = t_vec
+                camera_matrices.append(T)
+
+            # 5.2 从 point_observations 构建观测数组
+            observations, point_indices, camera_indices = [], [], []
+            for pt_idx, cam_dict in self.point_observations.items():
+                for cam_idx, xy in cam_dict.items():
+                    observations.append(xy)          # (x, y)
+                    point_indices.append(pt_idx)     # 该观测对应的三维点索引
+                    camera_indices.append(cam_idx)   # 该观测来自的相机索引
+
+            # 5.3 调用 BundleAdjustment.optimize
+            ba = BundleAdjustment(camera_intrinsics=self.K, verbose=True)
+            optimized_cams, optimized_pts3d, ba_info = ba.optimize(
+                cameras=camera_matrices,
+                points_3d=self.points_3d,
+                observations=observations,
+                point_indices=point_indices,
+                camera_indices=camera_indices
+            )
+
+            # 5.4 将优化结果写回 self.poses 和 self.points_3d
+            self.points_3d = optimized_pts3d
+            camera_matrices_to_save = optimized_cams
+            for idx, T_opt in enumerate(optimized_cams):
+                R_opt = T_opt[:3, :3]
+                t_opt = T_opt[:3, 3].reshape(3, 1)
+                self.poses[idx]['R'] = R_opt
+                self.poses[idx]['t'] = t_opt
+
+            # 5.5 输出优化信息
+            print(f"Bundle Adjustment 完成：")
+            print(f"  Success      : {ba_info['success']}")
+            print(f"  Initial cost : {ba_info['initial_cost']:.6f}")
+            print(f"  Final cost   : {ba_info['final_cost']:.6f}")
+            print(f"  Iterations   : {ba_info['iterations']}")
+
+        output_folder = self.output_dir
+        os.makedirs(output_folder, exist_ok=True)
+
+        ply_path = os.path.join(output_folder, "optimized_point_cloud.ply")
+        with open(ply_path, 'w') as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {self.points_3d.shape[0]}\n")
+            f.write("property float x\nproperty float y\nproperty float z\nend_header\n")
+            for pt in self.points_3d:
+                f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f}\n")
+        print(f"[INFO] Saved optimized point cloud to: {ply_path}")
+
+        traj_path = os.path.join(output_folder, "optimized_camera_trajectory.txt")
+        with open(traj_path, 'w') as f:
+            f.write("# CamIdx tx ty tz qx qy qz qw\n")
+            for i, T in enumerate(camera_matrices_to_save):
+                pos = T[:3, 3]
+                R_mat = T[:3, :3]
+                quat = R_scipy.from_matrix(R_mat).as_quat()  # (x,y,z,w)
+                f.write(
+                    f"{i} "
+                    f"{pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f} "
+                    f"{quat[0]:.6f} {quat[1]:.6f} {quat[2]:.6f} {quat[3]:.6f}\n"
+                )
+        print(f"[INFO] Saved optimized camera trajectory to: {traj_path}")
+
+        end_time = time.time()
+        print(f"Reconstruction completed in {end_time - start_time:.2f} seconds.")
+
+
+    def visualize_from_output(self):
+        """
+        从 output_dir 直接读取优化后的点云 (PLY) 和相机轨迹 (TXT)，
+        然后调用 visualize_with_open3d 可视化，不需要重新跑 pipeline。
+        """
+        # --- 1. 读取点云 ---
+        ply_file = os.path.join(self.output_dir, "optimized_point_cloud.ply")
+        if not os.path.isfile(ply_file):
+            raise FileNotFoundError(f"找不到点云文件：{ply_file}")
+        pcd = o3d.io.read_point_cloud(ply_file)
+        points = np.asarray(pcd.points, dtype=np.float64)
+
+        # --- 2. 读取相机轨迹 ---
+        traj_file = os.path.join(self.output_dir, "optimized_camera_trajectory.txt")
+        if not os.path.isfile(traj_file):
+            raise FileNotFoundError(f"找不到相机轨迹文件：{traj_file}")
+        poses = []
+        with open(traj_file, 'r') as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.strip().split()
+                # 格式：CamIdx tx ty tz qx qy qz qw
+                _, tx, ty, tz, qx, qy, qz, qw = parts
+                tx, ty, tz = map(float, (tx, ty, tz))
+                qx, qy, qz, qw = map(float, (qx, qy, qz, qw))
+                R_mat = R_scipy.from_quat([qx, qy, qz, qw]).as_matrix()
+                t_vec = np.array([tx, ty, tz]).reshape(3, 1)
+                poses.append({'R': R_mat, 't': t_vec})
+
+        # --- 3. 可视化 ---
+        print(f"[INFO] Loaded {len(points)} points and {len(poses)} camera poses from '{self.output_dir}'")
+        visualize_with_open3d(points,poses)
 
 if __name__ == "__main__":
-    main()
+    # Set your image folder path here
+    image_folder = 'images'
+    output_dir = 'output'
+    camera_intrinsics = 'camera_intrinsic.txt'  # Path to your camera intrinsics file
+
+    pipeline = ReconstructionPipeline(
+        image_folder=image_folder,
+        output_dir=output_dir,
+        camera_intrinsics=camera_intrinsics,
+        feature_extractor=True,
+        feature_matcher=True,
+        initial_pose_estimator=True,
+        pnp_estimator=True,
+        bundle_adjustment=False
+    )
+    pipeline.run()
+    pipeline.visualize_from_output()  # 可视化输出结果
+

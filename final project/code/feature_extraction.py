@@ -16,7 +16,6 @@ Extract SIFT features from an image.
 """
 
 
-
 def extract_sift_features(image_path: str, max_features: int = 5000) -> Tuple[List, Optional[np.ndarray]]:
     """
     Extract SIFT features from an image.
@@ -58,7 +57,6 @@ def extract_sift_features(image_path: str, max_features: int = 5000) -> Tuple[Li
         print("No descriptors found!")
     
     return keypoints, descriptors
-
 
 def extract_features_from_images(image_paths: List[str], method: str = 'sift') -> List[Tuple[List, Optional[np.ndarray]]]:
     """

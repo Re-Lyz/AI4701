@@ -360,18 +360,6 @@ if __name__ == "__main__":
                 if len(filtered_matches) > 0:
                     visualize_matches(image_paths[0], image_paths[1], kp1, kp2, 
                                     filtered_matches, max_matches=30, save_path="matches_filtered.jpg", show_plot=False)
-                    save_dir = "matches"
-                    Nf = len(filtered_matches)
-                    arr = np.zeros((Nf, 4), dtype=np.float32)
-                    for idx, m in enumerate(filtered_matches):
-                        arr[idx, 0] = m.queryIdx
-                        arr[idx, 1] = m.trainIdx
-                        arr[idx, 2] = m.imgIdx
-                        arr[idx, 3] = m.distance
-
-                    save_path_npy = os.path.join(save_dir, "matches_0_1.npy")
-                    np.save(save_path_npy, arr)
-                    print(f"[save] Saved {Nf} matches' attributes to '{save_path_npy}'")
 
     # Final summary
     print("\n" + "="*60)

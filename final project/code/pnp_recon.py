@@ -315,6 +315,91 @@ def print_reconstruction_summary(camera_poses, scene_points_3d):
     
     print("\n" + "=" * 60)
 
+import cv2
+import numpy as np
+from typing import List, Tuple
+
+def filter_matches_by_fundamental(
+    kp1: List[cv2.KeyPoint],
+    kp2: List[cv2.KeyPoint],
+    matches: List[cv2.DMatch],
+    ransac_thresh: float = 1.0,
+    confidence: float = 0.99
+) -> Tuple[List[cv2.DMatch], np.ndarray]:
+    """
+    用 Fundamental Matrix RANSAC 剔除错配
+    
+    Args:
+        kp1, kp2: 两幅图的 keypoints
+        matches: 原始匹配列表
+        ransac_thresh: RANSAC 重投影阈值（像素）
+        confidence: RANSAC 置信度
+    Returns:
+        inliers: 剔除外点后的匹配列表
+        F: Fundamental Matrix
+    """
+    # 1) 把匹配点转换成 Nx2 数组
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+    
+    # 2) 用 cv2.findFundamentalMat 做 RANSAC
+    F, mask = cv2.findFundamentalMat(
+        pts1, pts2,
+        method=cv2.FM_RANSAC,
+        ransacReprojThreshold=ransac_thresh,
+        confidence=confidence
+    )
+    if F is None:
+        return [], None
+    
+    # 3) 根据 mask 筛出 inliers
+    mask = mask.ravel()
+    inliers = [m for m, ok in zip(matches, mask) if ok]
+    return inliers, F
+
+
+def triangulate_points(
+    matches: List[cv2.DMatch],
+    kp1: List[cv2.KeyPoint],
+    kp2: List[cv2.KeyPoint],
+    K: np.ndarray,
+    R1: np.ndarray,
+    t1: np.ndarray,
+    R2: np.ndarray,
+    t2: np.ndarray
+) -> Tuple[np.ndarray, List[int]]:
+    """
+    对一对相机和它们的 inlier matches 进行三角化
+    
+    Args:
+        matches: 通过 filter_matches_by_fundamental 筛好的 inlier matches
+        kp1, kp2: keypoints 列表
+        K: 相机内参 3×3
+        R1,t1, R2,t2: 两台相机的外参
+    Returns:
+        pts3d: Nx3 的三维点阵
+        idxs: 这 N 个点在 matches 列表中的索引
+    """
+    # 1) 构造投影矩阵 P1,P2 (3×4)
+    P1 = K @ np.hstack((R1, t1.reshape(3,1)))
+    P2 = K @ np.hstack((R2, t2.reshape(3,1)))
+    
+    # 2) 提取匹配点坐标
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+    
+    # 3) OpenCV 三角化 (输出是 4×N 的齐次坐标)
+    pts4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
+    
+    # 4) 转成 Euclidean 坐标
+    pts4d /= pts4d[3]
+    pts3d = pts4d[:3].T  # Nx3
+    
+    # 5) 返回点和它们在 matches 列表中的索引
+    idxs = list(range(len(matches)))
+    return pts3d, idxs
+
+
 def visualize_camera_poses(R_list, t_list, save_path=None):
     """
     可视化所有相机（参考系在世界坐标系）和稀疏三维点
@@ -407,71 +492,59 @@ def visualize_scene_and_points(camera_poses, scene_points_3d, save_path=None):
         print(f"Scene reconstruction visualization saved to: {save_path}")
     plt.show()
 
-def visualize_with_open3d(camera_poses, scene_points_3d):
-    """
-    使用 Open3D 可视化重建结果：
-    - scene_points_3d: NumPy 数组，形状 (N,3)，N 个 3D 点
-    - camera_poses: list of dict，每个 dict 包含：
-        {
-            'R': 3x3 旋转矩阵 (numpy.ndarray),
-            't': 3x1 或长度为 3 的平移向量 (numpy.ndarray),
-            'image': 相机对应的图像名字（可选，只用来标注）
-        }
-    """
+import open3d as o3d
+import numpy as np
 
-    # 1. 将三维点构建成 Open3D 的 PointCloud 对象
+def visualize_with_open3d(scene_points_3d: np.ndarray,
+                          camera_poses: list,
+                          bg_color=(0.0, 0.0, 0.0)):
+    """
+    ------------------------------------------------------------------
+    scene_points_3d: (N,3) ndarray
+    camera_poses:    list of {'R':3x3 ndarray, 't':3x1 ndarray}
+    bg_color:        背景色 RGB tuple
+    """
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name='Reconstructed Scene', width=1280, height=720)
+    opt = vis.get_render_option()
+    opt.background_color = np.array(bg_color)
+    opt.point_size = 1.0
+
+    # 点云
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(scene_points_3d)
-    # 也可以给点云加一点颜色（可选）
-    # 例如：所有点都给成灰色
-    colors = np.tile(np.array([[0.7, 0.7, 0.7]]), (scene_points_3d.shape[0], 1))
-    pcd.colors = o3d.utility.Vector3dVector(colors)
+    gray = np.tile([0.8,0.8,0.8], (scene_points_3d.shape[0],1))
+    pcd.colors = o3d.utility.Vector3dVector(gray)
+    vis.add_geometry(pcd)
 
-    # 2. 构造摄像机坐标系（Coordinate Frame）和相机中心点
-    camera_frames = []   # 用来存放每个相机的坐标系（open3d.geometry.TriangleMesh）
-    camera_centers = []  # 用来存放每个相机的中心点（open3d.geometry.PointCloud）
+    # 相机坐标系和中心
+    for pose in camera_poses:
+        R_mat = pose['R']
+        t_vec = pose['t'].reshape(3,)
 
-    # 设置一个“相机坐标系”网格，用来表示相机的朝向与位置
-    # 这里我们用 open3d.geometry.TriangleMesh.create_coordinate_frame() 制作一个坐标轴小模型
-    for idx, pose in enumerate(camera_poses):
-        R = pose['R']            # 3x3 ndarray
-        t = pose['t'].reshape(3)  # 长度为 3 的向量
-
-        # 每个相机都建立自己的坐标系 mesh（大小可以调整 scale 参数）
+        # 坐标系三轴模型
         mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-            size=0.3,       # 坐标轴的长度（可自行调整） 
-            origin=[0, 0, 0]
+            size=0.3, origin=[0,0,0]
         )
+        T = np.eye(4)
+        T[:3, :3] = R_mat
+        T[:3,  3] = t_vec
+        mesh_frame.transform(T)
+        vis.add_geometry(mesh_frame)
 
-        # 对 mesh_frame 应用旋转和平移
-        # Open3D 里需要先把旋转矩阵转换成 4x4 变换矩阵，再赋值
-        # 注意：Open3D 使用右乘 4x4 坐标变换 T，这里 T 先把形状固定成 4x4
-        T = np.eye(4, dtype=np.float64)
-        T[:3, :3] = R       # 左上 3×3 放 R
-        T[:3, 3] = t        # 前 3 个元素是平移向量 t
-        mesh_frame.transform(T)  # 对 mesh_frame 做变换，使坐标系移动到相机中心
+        # # 小球表示相机光心
+        # sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+        # sphere.paint_uniform_color([1.0, 0.0, 0.0])
+        # sphere.translate(t_vec)
+        # vis.add_geometry(sphere)
 
-        camera_frames.append(mesh_frame)
+    # 交互式运行：拖拽 & 缩放查看
+    vis.run()
+    vis.destroy_window()
 
-        # 同时画一个小球或点来表示相机中心
-        cam_pt = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)  # 半径 0.05 的小球
-        cam_pt.paint_uniform_color([1.0, 0.0, 0.0])  # 红色小球
-        cam_pt.translate(t)  # 把小球移动到相机中心
-        camera_centers.append(cam_pt)
-
-    # 3. 把所有对象一起加入到一个 Open3D 场景里
-    o3d.visualization.draw_geometries(
-        [pcd] + camera_frames + camera_centers,
-        window_name='Reconstructed Scene (with Open3D)',
-        width=1280,
-        height=720,
-        left=50,
-        top=50,
-        point_show_normal=False,
-        mesh_show_wireframe=False,
-        mesh_show_back_face=False
-    )
-
+    
+    
+    
 if __name__ == "__main__":
     from feature_extraction import extract_features_from_images
     from feature_matching import match_image_pairs,match_sift_features,filter_matches_by_homography
@@ -639,3 +712,6 @@ if __name__ == "__main__":
         print(f"    - Rotation (Euler deg): {euler_i}")
     print(f"\nTotal 3D points: {scene_points_3d.shape[0]}")
     print("="*60)
+    
+    
+    
