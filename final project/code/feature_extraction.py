@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 import os
 from typing import List, Tuple, Optional
+from pathlib import Path
 
 """
 Extract SIFT features from an image.
@@ -15,8 +16,7 @@ Extract SIFT features from an image.
 
 """
 
-
-def extract_sift_features(image_path: str, max_features: int = 5000) -> Tuple[List, Optional[np.ndarray]]:
+def extract_sift_features(image_path: str, max_features: int = 10000) -> Tuple[List, Optional[np.ndarray]]:
     """
     Extract SIFT features from an image.
     
@@ -84,10 +84,7 @@ def extract_features_from_images(image_paths: List[str], method: str = 'sift') -
             
         feature_data.append((keypoints, descriptors))
         
-        # Print summary for this image
-        # if descriptors is not None:
-        #     print(f"Successfully extracted {len(keypoints)} features")
-        # else:
+
         if descriptors is None:
             print("Failed to extract features from this image")
     
@@ -95,6 +92,94 @@ def extract_features_from_images(image_paths: List[str], method: str = 'sift') -
     valid_images = sum(1 for _, desc in feature_data if desc is not None)
     print(f"Valid images with features: {valid_images}/{len(image_paths)}")
     
+    return feature_data
+
+def load_or_extract_features(
+    image_paths: List[str],
+    method: str = 'sift',
+    load: bool = True,
+    save: bool = False,
+    output_dir: Optional[str] = None
+) -> List[Tuple[List[cv2.KeyPoint], Optional[np.ndarray]]]:
+    """
+    load=True 时先检查 output_dir/features.yml，
+      - 如果存在则一次性加载所有图像的特征；
+      - 否则走 extract（并可选保存）。
+    load=False 时直接走 extract。
+    """
+    if save and output_dir is None:
+        raise ValueError("save=True 时必须指定 output_dir")
+    if save:
+        os.makedirs(output_dir, exist_ok=True)
+
+    # 1) 如果允许加载并且文件存在，就一次性读回所有特征
+    if load and output_dir:
+        fs_path = Path(output_dir) / "features.yml"
+        if fs_path.exists():
+            fs = cv2.FileStorage(str(fs_path), cv2.FILE_STORAGE_READ)
+            feats = []
+            for idx in range(len(image_paths)):
+                desc = fs.getNode(f"descriptors_{idx}").mat()
+                kp_arr = fs.getNode(f"keypoints_{idx}").mat()
+                kps = [
+                    cv2.KeyPoint(
+                        x=float(x), y=float(y),
+                        size=float(size), angle=float(angle),
+                        response=float(response),
+                        octave=int(octave),
+                        class_id=int(class_id)
+                    )
+                    for x, y, size, angle, response, octave, class_id in kp_arr
+                ]
+                feats.append((kps, desc))
+            fs.release()
+            print("检测到 features.yml，已一次性加载所有特征。")
+            return feats
+
+    # 2) 否则重新提取（并可选保存）
+    print("开始提取特征…")
+    return extract_features_from_images_save(
+        image_paths, method=method, save=save, output_dir=output_dir
+    )
+
+def extract_features_from_images_save(
+    image_paths: List[str],
+    method: str = 'sift',
+    save: bool = False,
+    output_dir: Optional[str] = None
+) -> List[Tuple[List[cv2.KeyPoint], Optional[np.ndarray]]]:
+    """
+    对 image_paths 中所有图像做特征提取，返回 [(kps, desc), ...]。
+    如果 save=True，会把所有结果写入 output_dir/features.yml。
+    """
+    feature_data = []
+    for img_path in image_paths:
+        if method.lower() == 'sift':
+            kps, desc = extract_sift_features(img_path)
+        else:
+            print(f"Unknown method: {method}, fallback to SIFT.")
+            kps, desc = extract_sift_features(img_path)
+        feature_data.append((kps, desc))
+
+    if save and output_dir:
+        fs_path = Path(output_dir) / "features.yml"
+        fs = cv2.FileStorage(str(fs_path), cv2.FILE_STORAGE_WRITE)
+        for idx, (kps, desc) in enumerate(feature_data):
+            # 写 descriptors（空矩阵也写）
+            fs.write(f"descriptors_{idx}", desc if desc is not None else np.array([]))
+            # 写 keypoints 为 (N,7) 数组
+            kp_arr = np.array([
+                (kp.pt[0], kp.pt[1],
+                 kp.size, kp.angle,
+                 kp.response, kp.octave, kp.class_id)
+                for kp in kps
+            ], dtype=np.float32)
+            fs.write(f"keypoints_{idx}", kp_arr)
+        fs.release()
+        print(f"已保存所有图像特征到 {fs_path}")
+
+    valid = sum(1 for _, d in feature_data if d is not None)
+    print(f"=== 特征提取完成: {valid}/{len(image_paths)} 张图像有效 ===")
     return feature_data
 
 def visualize_keypoints(image_path: str, keypoints: List, max_keypoints: int = 100, save_path: Optional[str] = None):
@@ -203,6 +288,7 @@ def save_features_to_file(feature_data: List[Tuple[List, Optional[np.ndarray]]],
             np.save(kp_file, kp_coords)
             
             print(f"Saved features for {base_name}: {len(keypoints)} keypoints")
+
 
 if __name__ == "__main__":
     # Test the module

@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import os
+from pathlib import Path
 from typing import List, Tuple, Optional
 import matplotlib.pyplot as plt
 
@@ -243,6 +244,121 @@ def display_matches_for_pairs(image_paths: List[str], feature_data: List[Tuple],
                             max_matches=50, save_path=save_path, show_plot=True)
             
             pair_count += 1
+
+def match_image_pairs_save(
+    feature_data: List[Tuple[List[cv2.KeyPoint], Optional[np.ndarray]]],
+    method: str = 'sift',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+    filename: str = "all_matches.yml"
+) -> List[List[List[cv2.DMatch]]]:
+    """
+    匹配所有图像对，并在 save=True 时，用 FileStorage 序列化保存到 output_dir/filename。
+    返回原始 cv2.DMatch 结构的 raw_matches。
+    """
+    if save and output_dir is None:
+        raise ValueError("save=True 时必须指定 output_dir")
+    if save:
+        os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\n=== [{method.upper()}] 两两特征匹配开始 ===")
+    n = len(feature_data)
+    raw_matches: List[List[List[cv2.DMatch]]] = []
+
+    # 1. 计算 raw_matches
+    for i in range(n):
+        row = []
+        for j in range(n):
+            if i == j:
+                row.append([])
+                continue
+            _, desc1 = feature_data[i]
+            _, desc2 = feature_data[j]
+            if desc1 is None or desc2 is None:
+                row.append([])
+            elif method.lower() == 'sift':
+                row.append(match_sift_features(desc1, desc2))
+            else:
+                print(f"Unknown method: {method}, use SIFT.")
+                row.append(match_sift_features(desc1, desc2))
+        raw_matches.append(row)
+
+    # 2. 保存
+    if save:
+        fs_path = Path(output_dir) / filename
+        fs = cv2.FileStorage(str(fs_path), cv2.FILE_STORAGE_WRITE)
+        for i in range(n):
+            for j in range(n):
+                cell = raw_matches[i][j]
+                arr = np.array([
+                    (m.queryIdx, m.trainIdx, m.imgIdx, m.distance)
+                    for m in cell
+                ], dtype=np.float32)
+                fs.write(f"matches_{i}_{j}", arr)
+        fs.release()
+        print(f"[CVFS] Saved matches to {fs_path}")
+
+    return raw_matches
+
+
+def load_or_match_image_pairs(
+    feature_data: List[Tuple[List[cv2.KeyPoint], Optional[np.ndarray]]],
+    method: str = 'sift',
+    load: bool = True,
+    save: bool = False,
+    output_dir: Optional[str] = None,
+    filename: str = "all_matches.yml"
+) -> List[List[List[cv2.DMatch]]]:
+    """
+    load=True 时若 output_dir/filename 存在，则用 FileStorage 加载并重建 DMatch；
+    否则重新匹配并（可选）用 FileStorage 保存。
+    """
+    if save and output_dir is None:
+        raise ValueError("save=True 时必须指定 output_dir")
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    file_path = Path(output_dir or "") / filename
+
+    # 强制重新匹配
+    if save:
+        print("[DEBUG] save=True，强制重新匹配并保存")
+        return match_image_pairs_save(
+            feature_data, method=method, save=True,
+            output_dir=output_dir, filename=filename
+        )
+
+    # 尝试加载
+    if load and file_path.exists():
+        print(f"[CVFS] Loading matches from {file_path}")
+        fs = cv2.FileStorage(str(file_path), cv2.FILE_STORAGE_READ)
+        n = len(feature_data)
+        all_matches: List[List[List[cv2.DMatch]]] = []
+        for i in range(n):
+            row: List[List[cv2.DMatch]] = []
+            for j in range(n):
+                node = fs.getNode(f"matches_{i}_{j}")
+                if node.empty():
+                    row.append([])
+                    continue
+                arr = node.mat()
+                if arr is None:
+                    arr = np.empty((0,4), dtype=np.float32)
+                cell = [cv2.DMatch(int(q), int(t), int(img), float(d))
+                        for q, t, img, d in arr]
+                row.append(cell)
+            all_matches.append(row)
+        fs.release()
+        return all_matches
+
+    # 否则重新匹配（不保存）
+    print("[DEBUG] 未加载缓存，开始重新匹配（不保存）…")
+    return match_image_pairs_save(
+        feature_data, method=method, save=False,
+        output_dir=output_dir, filename=filename
+    )
+
+
 
 def filter_matches_by_homography(kp1: List, kp2: List, matches: List, 
                                 ransac_threshold: float = 5.0) -> Tuple[List, Optional[np.ndarray]]:

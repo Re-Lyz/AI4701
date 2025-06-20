@@ -1,4 +1,6 @@
 *.csv
+all_matches.yml
+features.yml
 __MACOSX/
 final project/images/
 final project/output/
