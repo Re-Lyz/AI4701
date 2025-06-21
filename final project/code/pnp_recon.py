@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import os
 import open3d as o3d
-from typing import List, Tuple
+from typing import List, Tuple,Dict
 
 
 def pnp_pose(image_points, object_points, K):
@@ -84,9 +84,86 @@ def triangulate_points(
 
     return valid_pts, valid_idxs
 
+def multi_view_triangulation(
+    new_idx: int,
+    anchor_idxs: List[int],
+    features: List[Tuple[List[cv2.KeyPoint], np.ndarray]],
+    al_matches: List[List[List[cv2.DMatch]]],
+    camera_poses: Dict[int, Dict[str, np.ndarray]],
+    points_3d: Dict[int, np.ndarray],      # <–– 新增
+    K: np.ndarray,
+    min_parallax_deg: float = 1.0,
+    reproj_thresh: float = 5.0
+) -> List[Tuple[int, np.ndarray, Dict[int, float]]]:
+    """
+    对 new_idx 和 anchor_idxs 中每对做两视图三角，返回新增点列表：
+      (pid, X3d, {cam: reproj_error, ...})
+
+    points_3d 用来确定下一个可用 pid。
+    """
+    new_points = []
+    # 从已有点 ID 计算下一个可用 pid
+    pid_start = max(points_3d.keys(), default=-1) + 1
+
+    for a in anchor_idxs:
+        kp_a, _ = features[a]
+        kp_n, _ = features[new_idx]
+        matches_an = al_matches[a][new_idx]
+
+        R_a, t_a = camera_poses[a]['R'], camera_poses[a]['t']
+        R_n, t_n = camera_poses[new_idx]['R'], camera_poses[new_idx]['t']
+
+        P1 = K @ np.hstack([R_a, t_a])
+        P2 = K @ np.hstack([R_n, t_n])
+
+        pts1 = np.float32([kp_a[m.queryIdx].pt for m in matches_an]).T
+        pts2 = np.float32([kp_n[m.trainIdx].pt for m in matches_an]).T
+        X4 = cv2.triangulatePoints(P1, P2, pts1, pts2)
+        X3 = (X4[:3] / X4[3]).T
+
+        for i, m in enumerate(matches_an):
+            X = X3[i]
+
+            # cheirality 检验
+            if (R_a[2] @ (X - t_a.flatten())) <= 0 or \
+               (R_n[2] @ (X - t_n.flatten())) <= 0:
+                continue
+
+            # 重投影误差
+            x1_proj, _ = cv2.projectPoints(
+                X.reshape(1,3), cv2.Rodrigues(R_a)[0], t_a, K, None
+            )
+            x2_proj, _ = cv2.projectPoints(
+                X.reshape(1,3), cv2.Rodrigues(R_n)[0], t_n, K, None
+            )
+            err1 = np.linalg.norm(x1_proj.ravel() - kp_a[m.queryIdx].pt)
+            err2 = np.linalg.norm(x2_proj.ravel() - kp_n[m.trainIdx].pt)
+            if err1 > reproj_thresh or err2 > reproj_thresh:
+                continue
+
+            # 视差角度过滤
+            ray1 = X - t_a.flatten()
+            ray2 = X - t_n.flatten()
+            angle = np.arccos(
+                np.dot(ray1, ray2) /
+                (np.linalg.norm(ray1) * np.linalg.norm(ray2))
+            )
+            if np.degrees(angle) < min_parallax_deg:
+                continue
+            match_map = {
+                a: matches_an[i],        # matches_an 是 anchor→new 的 DMatch 列表
+                new_idx: matches_an[i]
+            }
+            
+            pid = pid_start
+            pid_start += 1
+            new_points.append((pid, X, match_map))
+
+    return new_points
+
 def visualize_with_open3d(
     scene_points_3d: np.ndarray,
-    camera_poses: List[dict],
+    camera_mats: List[dict],      
     bg_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     show_cameras: bool = False
 ):
@@ -96,28 +173,162 @@ def visualize_with_open3d(
     opt.background_color = np.array(bg_color)
     opt.point_size = 1.0
 
-    # 点云：黑色前景
+    # 点云
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(scene_points_3d)
-    black = np.zeros((scene_points_3d.shape[0], 3))
-    pcd.colors = o3d.utility.Vector3dVector(black)
+    pcd.colors = o3d.utility.Vector3dVector(np.zeros_like(scene_points_3d))
     vis.add_geometry(pcd)
 
     if show_cameras:
-        for pose in camera_poses:
-            R_mat = pose['R']
-            t_vec = pose['t'].reshape(3,)
-            mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-                size=0.3, origin=[0, 0, 0]
-            )
-            T = np.eye(4)
-            T[:3, :3] = R_mat
-            T[:3, 3] = t_vec
-            mesh_frame.transform(T)
-            vis.add_geometry(mesh_frame)
+        for pose in camera_mats:  # 修复：使用 camera_mats 而不是 camera_poses
+            # 把 dict → 4×4 矩阵
+            if isinstance(pose, dict):
+                Rm = pose['R']
+                tv = pose['t'].reshape(3,)
+                T = np.eye(4, dtype=np.float64)   
+                T[:3,:3] = Rm
+                T[:3,3] = tv
+            else:
+                # 如果已经是4x4矩阵
+                T = pose.astype(np.float64)
+
+            frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)
+            frame.transform(T)
+            vis.add_geometry(frame)
+
+    # —— 用第一个相机作为视角 —— 
+    first_cam = camera_mats[0]
+    
+    # 处理不同的输入格式
+    if isinstance(first_cam, dict):
+        R0 = first_cam['R'].astype(np.float64)
+        t0 = first_cam['t'].reshape(3).astype(np.float64)
+        T0 = np.eye(4, dtype=np.float64)
+        T0[:3, :3] = R0
+        T0[:3, 3] = t0
+    else:
+        T0 = first_cam.astype(np.float64)
+        R0 = T0[:3, :3]
+        t0 = T0[:3, 3]
+
+    # 相机中心（世界坐标系中的位置）
+    cam_center = t0
+    lookat = scene_points_3d.mean(axis=0)
+    
+    # 计算相机朝向
+    # 在计算机视觉中，相机通常看向-Z方向
+    front = (cam_center - lookat)
+    front /= np.linalg.norm(front)
+
+    # up 是相机的-Y方向（因为图像坐标系Y向下，世界坐标系Y向上）
+    up_vec = R0 @ np.array([0, -1, 0], dtype=np.float64)  # 修复：使用-Y
+    up = up_vec / np.linalg.norm(up_vec)
+
+    # lookat 点设置在相机前方
+
+
+    # 设置视角 - 需要在添加所有几何体后设置
+    vis.poll_events()
+    vis.update_renderer()
+    
+    ctr = vis.get_view_control()
+    ctr.set_lookat(lookat.tolist())  # 转换为list
+    ctr.set_front(front.tolist())
+    ctr.set_up(up.tolist())
+    ctr.set_zoom(0.1)
 
     vis.run()
     vis.destroy_window()
+
+def visualize_colored_point_cloud(
+    scene_points_3d: np.ndarray,
+    camera_mats: np.ndarray,       # (N_cam,4,4)
+    image_paths: List[str],        # 对应每台相机的 RGB 图路径列表
+    K: np.ndarray,              # 相机内参矩阵 (3,3)
+    color_cam_idx: int = 0,        # 用第几台相机的图像做取色
+    bg_color=(1,1,1),
+    zoom: float = 0.8
+):
+    """
+    可视化带颜色的稀疏点云：
+      - scene_points_3d: (N,3) 点云
+      - camera_mats:      (N_cam,4,4) 外参齐次矩阵
+      - image_paths:      N_cam 长度的 RGB 图路径
+      - color_cam_idx:    选哪台相机的图像来给点着色
+    """
+    # 1) 读取要取色的那张 RGB 图
+    color_img = cv2.imread(image_paths[color_cam_idx], cv2.IMREAD_COLOR)
+    if color_img is None:
+        raise ValueError(f"Cannot read color image: {image_paths[color_cam_idx]}")
+    color_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
+    h, w, _ = color_img.shape
+
+    # 2) 投影点云到该相机
+    T = camera_mats[color_cam_idx]
+    R, t = T[:3,:3], T[:3,3]
+    
+
+    Xc = (R @ scene_points_3d.T) + t.reshape(3,1)   # (3,N)
+    uv = K @ Xc                                      # (3,N)
+    uv = uv[:2] / uv[2:3]                            # (2,N)
+    uv = uv.T                                        # (N,2)
+
+    # 3) 从图像中取色
+    colors = np.zeros((scene_points_3d.shape[0], 3), dtype=np.float64)
+    for i, (u, v) in enumerate(uv):
+        ui = int(np.clip(round(u), 0, w-1))
+        vi = int(np.clip(round(v), 0, h-1))
+        colors[i] = color_img[vi, ui] / 255.0
+
+    # 4) Open3D 可视化
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Colored Sparse Cloud", width=1280, height=720)
+    opt = vis.get_render_option()
+    opt.background_color = np.array(bg_color)
+    opt.point_size       = 2.0
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(scene_points_3d)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    vis.add_geometry(pcd)
+
+    # —— 用第一个相机作为视角 —— 
+    first_cam = camera_mats[0]
+    
+    # 处理不同的输入格式
+    if isinstance(first_cam, dict):
+        R0 = first_cam['R'].astype(np.float64)
+        t0 = first_cam['t'].reshape(3).astype(np.float64)
+        T0 = np.eye(4, dtype=np.float64)
+        T0[:3, :3] = R0
+        T0[:3, 3] = t0
+    else:
+        T0 = first_cam.astype(np.float64)
+        R0 = T0[:3, :3]
+        t0 = T0[:3, 3]
+
+    # 相机中心（世界坐标系中的位置）
+    cam_center = t0
+    lookat = scene_points_3d.mean(axis=0)
+    
+    # 计算相机朝向
+    # 在计算机视觉中，相机通常看向-Z方向
+    front = (cam_center - lookat)
+    front /= np.linalg.norm(front)
+
+    # up 是相机的-Y方向（因为图像坐标系Y向下，世界坐标系Y向上）
+    up_vec = R0 @ np.array([0, -1, 0], dtype=np.float64)  # 修复：使用-Y
+    up = up_vec / np.linalg.norm(up_vec)
+
+    ctr = vis.get_view_control()
+    ctr.set_lookat(lookat.tolist())
+    ctr.set_front(front.tolist())
+    ctr.set_up(up.tolist())
+    ctr.set_zoom(zoom)
+
+    vis.run()
+    vis.destroy_window()
+
 
 if __name__ == "__main__":
     from feature_extraction import extract_features_from_images

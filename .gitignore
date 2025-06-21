@@ -4,7 +4,8 @@ features.yml
 __MACOSX/
 final project/images/
 final project/output/
-
+final project/results/
+final project/sift/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

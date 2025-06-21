@@ -7,131 +7,21 @@ from scipy.spatial.transform import Rotation as R_scipy
 import open3d as o3d
 from contextlib import redirect_stdout
 from feature_extraction import load_or_extract_features
-from feature_matching import load_or_match_image_pairs, filter_matches_by_homography
-from initial_recon import estimate_pose, print_pose_info
+from feature_matching import load_or_match_image_pairs, filter_matches_by_homography, filter_two_view_geometry
+from initial_recon import print_pose_info, pick_initial_pair
 from pnp_recon import pnp_pose, visualize_with_open3d, triangulate_points
 from bundle_adjustment import BundleAdjustment
+from incremental_sfm import IncrementalSfM
 
-def compute_parallax(
-    pts1: np.ndarray,
-    pts2: np.ndarray,
-    R: np.ndarray,
-    t: np.ndarray,
-    K: np.ndarray
-) -> float:
-    """
-    计算一组匹配内点的平均归一化视差：
-      1) 将像素点转换为归一化相机坐标系下的射线方向
-      2) 将第一幅图的射线变换到第二幅图坐标系
-      3) 计算两组射线的夹角（视差），并取平均
-    """
-    # 1. 转为齐次坐标并归一化
-    ones = np.ones((pts1.shape[0], 1))
-    homo1 = np.hstack([pts1, ones])
-    homo2 = np.hstack([pts2, ones])
+def recenter_poses(poses: Dict[int,Tuple[np.ndarray,np.ndarray]], world_idx: int):
+    R_w, t_w = poses[world_idx]
+    new_poses = {}
+    for k, (R_k, t_k) in poses.items():
+        Rk_new = R_k @ R_w.T
+        tk_new = t_k - Rk_new @ t_w
+        new_poses[k] = (Rk_new, tk_new)
+    return new_poses
 
-    rays1 = (np.linalg.inv(K) @ homo1.T).T
-    rays2 = (np.linalg.inv(K) @ homo2.T).T
-
-    # 2. 将第一张图的射线旋转平移到第二张图坐标系
-    rays1_in_2 = (R @ rays1.T + t).T
-
-    # 3. 归一化方向向量
-    rays1_norm = rays1 / np.linalg.norm(rays1, axis=1, keepdims=True)
-    rays2_norm = rays1_in_2 / np.linalg.norm(rays1_in_2, axis=1, keepdims=True)
-
-    # 4. 计算夹角（点积的 arccos）
-    cos_angles = np.sum(rays1_norm * rays2_norm, axis=1)
-    cos_angles = np.clip(cos_angles, -1.0, 1.0)
-    angles = np.arccos(cos_angles)
-
-    return float(np.mean(angles))
-
-def pick_initial_pair(
-    K: np.ndarray,
-    al_matches: List[List[List[cv2.DMatch]]],
-    keypoints: List[List[cv2.KeyPoint]],
-    min_inliers: int = 50,
-    parallax_thresh: float = 0.01
-) -> Tuple[int, int, np.ndarray, np.ndarray, List[cv2.DMatch]]:
-    """
-    从 al_matches 中选出用于初始化的最佳图像对，
-    并使用 RANSAC + cv2.recoverPose 恢复 R, t, 以及内点匹配 inlier_matches。
-
-    Args:
-        K: 相机内参矩阵
-        al_matches: shape = [N][N] 的匹配列表矩阵，其中 al_matches[i][j] 是 i->j 的候选匹配
-        keypoints: 每张图对应的 KeyPoint 列表
-        min_inliers: 内点匹配最小阈值
-        parallax_thresh: 归一化视差最小阈值
-
-    Returns:
-        best_i, best_j: 选中的图像对索引
-        best_R, best_t: 恢复的相对位姿
-        best_inliers: 对应的内点匹配列表
-    """
-    num_images = len(al_matches)
-    best_score = 0
-    best_i, best_j = -1, -1
-    best_R = np.eye(3)
-    best_t = np.zeros((3,1))
-    best_inliers: List[cv2.DMatch] = []
-
-    for i in range(num_images):
-        for j in range(i+1, num_images):
-            matches_ij = al_matches[i][j]
-            if len(matches_ij) < min_inliers:
-                continue
-
-            # 提取匹配点坐标
-            pts1 = np.array([keypoints[i][m.queryIdx].pt for m in matches_ij])
-            pts2 = np.array([keypoints[j][m.trainIdx].pt for m in matches_ij])
-
-            # 1) 用 RANSAC 估计本质矩阵
-            E, mask = cv2.findEssentialMat(
-                pts1, pts2, K,
-                method=cv2.RANSAC,
-                prob=0.999,
-                threshold=1.0
-            )
-            if E is None or mask is None:
-                continue
-
-            # 筛选足够多的内点
-            inlier_mask = mask.ravel().astype(bool)
-            n_inliers = int(inlier_mask.sum())
-            if n_inliers < min_inliers:
-                continue
-
-            # 2) 恢复相对位姿
-            _, R, t, mask_pose = cv2.recoverPose(
-                E, pts1, pts2, K, mask=mask
-            )
-            pose_mask = mask_pose.ravel().astype(bool)
-
-            # 收集真正的内点 matches
-            inlier_matches = [
-                m for m, ok in zip(matches_ij, pose_mask) if ok
-            ]
-
-            # 3) 计算平均视差
-            inlier_pts1 = pts1[pose_mask]
-            inlier_pts2 = pts2[pose_mask]
-            parallax = compute_parallax(inlier_pts1, inlier_pts2, R, t, K)
-            if parallax < parallax_thresh:
-                continue
-
-            # 4) 用内点数作为评分并更新最优
-            if n_inliers > best_score:
-                best_score = n_inliers
-                best_i, best_j = i, j
-                best_R, best_t = R, t
-                best_inliers = inlier_matches
-
-    if best_score == 0:
-        raise RuntimeError("没有找到满足条件的初始图像对，请降低阈值或检查匹配质量。")
-
-    return best_i, best_j, best_R, best_t, best_inliers
 class ReconstructionPipeline:
     def __init__(
         self,
@@ -161,12 +51,7 @@ class ReconstructionPipeline:
 
         # Gather image paths
         self.image_paths = []
-        for root, dirs, files in os.walk(image_folder):
-            self.image_paths = [os.path.join(root, f) for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-            if self.image_paths:
-                break
-        if not self.image_paths:
-            raise FileNotFoundError(f"No images found in folder: {image_folder}")
+        self._load_images()
 
         # Load camera intrinsics
         k_path = self.camera_intrinsics
@@ -183,7 +68,28 @@ class ReconstructionPipeline:
         self.points_3d: np.ndarray = None
         self.point_observations: Dict[int, Dict[int, tuple]] = {}
         self.al_matches: List[List[List[cv2.DMatch]]] = []
-        
+
+    def _load_images(self):
+        # 遍历文件夹，但先把 files 排序
+        paths = []
+        for root, dirs, files in os.walk(self.image_folder):
+            files = sorted(files)  # 按文件名排序
+            for f in files:
+                if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    paths.append(os.path.join(root, f))
+        self.image_paths = paths
+
+    def get_world_idx(self, world_filename: str) -> int:
+        """
+        传入你想当世界坐标的文件名（不含路径），
+        返回对应的 self.image_paths 索引。
+        """
+        # 方法一：利用 list.index，要求 image_paths 中的 path 是完整路径
+        target = world_filename
+        for idx, p in enumerate(self.image_paths):
+            if os.path.basename(p) == target:
+                return idx
+        raise ValueError(f"无法在 image_paths 中找到文件 {world_filename}")        
         
     def run(self):
         start_time = time.time()
@@ -240,7 +146,7 @@ class ReconstructionPipeline:
                         continue
                     
                     # 2. RANSAC + 单应性过滤
-                    inlier_matches, _ = _run_quiet(filter_matches_by_homography, kp1, kp2, matches)
+                    inlier_matches, _ = _run_quiet(filter_two_view_geometry, kp1, kp2, matches, self.K)
                     row.append(inlier_matches)
                 al_matches.append(row)
             self.al_matches = al_matches
@@ -258,95 +164,57 @@ class ReconstructionPipeline:
             i, j, R, t, inliers = pick_initial_pair(self.K, self.al_matches, keypoints=[kp_tuple[0] for kp_tuple in self.features])
             # 记录真正的参考图像索引
             self.init_i, self.init_j = i, j
-            # 保存第一对相机：第 i 张为“0”，第 j 张为“1”
-            self.poses = [
-                {'R': np.eye(3),         't': np.zeros((3,1)), 'inliers': None,     'pair': (None, i)},
-                {'R': R,                 't': t,               'inliers': inliers, 'pair': (i, j)},
-            ]
-            # 用于后续判断哪些图已加入
-            self.registered_cams = [i, j]
+            print(f"Initial pair: image {i} and image {j}")
             print_pose_info(R, t, len(inliers), len(inliers))
+            # 准备 features 和 matches 的 dict 结构
+            num_images = len(self.features)
+            features_dict = {i: self.features[i] for i in range(num_images)}
+            matches_dict = {}
+            for i in range(num_images):
+                for j in range(i+1, num_images):
+                    m = self.al_matches[i][j]
+                    if m:
+                        matches_dict[(i, j)] = m
+                    # 实例化并初始化
+            sfm = IncrementalSfM(self.K, optimize_intrinsics=True)
+            sfm.features = features_dict
+            sfm.matches = matches_dict
+            init_pair = (self.init_i, self.init_j)
+            if not sfm.initialize_reconstruction(init_pair):
+                raise RuntimeError("初始化失败，请检查初始图像对或匹配质量。")
 
         # 4. PnP Pose Estimation and Incremental Triangulation
         if self.pnp_estimator and len(self.poses) >= 2:
-            print("Triangulating initial 3D points between frames "
-                  f"{self.init_i} & {self.init_j} ...")
 
-            # 相机 0 是 identity；相机 1 是 (i→j) 的初始外参
-            zero  = self.poses[0]
-            first = self.poses[1]
-            kp_i, _ = self.features[self.init_i]
-            kp_j, _ = self.features[self.init_j]
-
-            # 1) 初始化三角化得到 valid_idxs，对应的 self.points_3d[0:N_init]
-            initial_pts3d, valid_idxs = triangulate_points(
-                first['inliers'], kp_i, kp_j, self.K,
-                zero['R'], zero['t'], first['R'], first['t']
-            )
-            self.points_3d = initial_pts3d.copy()
-
-            # 2) 建立 queryIdx -> pid 的映射
-            query_to_pid = {}
-            for pid, valid_idx in enumerate(valid_idxs):
-                m0 = first['inliers'][valid_idx]
-                query_to_pid[m0.queryIdx] = pid
-
-            # 3) 用列表存观测，最后再转 dict
-            obs_list = [
-                {
-                    self.init_i: kp_i[first['inliers'][i].queryIdx].pt,
-                    self.init_j: kp_j[first['inliers'][i].trainIdx].pt
-                }
-                for i in valid_idxs
-            ]
-
-            # 4) 增量处理每张新图，只和 init_i 做 PnP
-            for img_idx in range(len(self.image_paths)):
-                if img_idx in self.registered_cams:
-                    continue
-                
-                # —— 必须先拿到这张图的 keypoints —— 
-                kp_new, desc_new = self.features[img_idx]
-
-                filt = self.al_matches[self.init_i][img_idx]
-                if len(filt) < 6:
-                    continue
-                
-                # 5) 批量构造 obj_pts, img_pts, pid_list
-                obj_pts, img_pts, pid_list = [], [], []
-                for m in filt:
-                    pid = query_to_pid.get(m.queryIdx)
-                    if pid is not None:
-                        obj_pts.append(self.points_3d[pid])
-                        img_pts.append(kp_new[m.trainIdx].pt)
-                        pid_list.append(pid)
-
-                if len(obj_pts) < 6:
-                    continue
-                
-                # 6) RANSAC PnP
-                Rn, tn, inliers = pnp_pose(img_pts, obj_pts, self.K)
-                inlier_idxs = inliers.flatten().tolist()
-
-                # 7) 保存新相机
-                self.poses.append({
-                    'R': Rn, 't': tn, 'inliers': inlier_idxs,
-                    'pair': (self.init_i, img_idx)
-                })
-                self.registered_cams.append(img_idx)
-
-                # 8) 批量更新 obs_list
-                for idx in inlier_idxs:
-                    pid = pid_list[idx]
-                    obs_list[pid][img_idx] = img_pts[idx]
-
-            # 9) 最终转回 dict 形式
+                    # 完整增量重建
+            success = sfm.reconstruct_incremental(sfm.features, sfm.matches, init_pair)
+            if not success:
+                raise RuntimeError("增量重建中断。")
+                    # 同步结果回原对象
+            # 相机位姿
+            self.poses = []
+            self.registered_cams = list(sfm.registered_cams)
+            for cam_idx, cam in sfm.cameras.items():
+                if cam_idx in sfm.registered_cams:
+                    self.poses.append({
+                        'R': cam.R,
+                        't': cam.t,
+                        # 如果需要 inliers 信息，可以从 sfm.ransac 里缓存
+                        'pair': None
+                    })
+                    # 3D 点坐标阵列
+            self.points_3d = np.vstack([pt.xyz for pt in sfm.points_3d.values()])
+                    # 点的观测字典
             self.point_observations = {
-                pid: obs for pid, obs in enumerate(obs_list)
+                pid: pt.observations
+                for pid, pt in sfm.points_3d.items()
             }
+            print(f"增量式重建完成：注册相机 {len(self.poses)}/{num_images}，三维点数 {len(self.points_3d)}")
+            
+        w_idx = self.get_world_idx("DJI_20200223_163016_842.jpg")
+        print("world_idx =", w_idx)
+        self.poses = recenter_poses(self.poses, world_idx=w_idx)
 
-
-        
         camera_matrices = []
         for pose in self.poses:
             T = np.eye(4, dtype=np.float64)
@@ -359,16 +227,6 @@ class ReconstructionPipeline:
         # 5. Bundle Adjustment
         if self.bundle_adjustment:
             print("Running bundle adjustment...")
-
-            # 5.1 将 self.poses 转为 4x4 矩阵列表
-            camera_matrices = []
-            for pose in self.poses:
-                T = np.eye(4, dtype=np.float64)
-                T[:3, :3] = pose['R']
-                # 如果 t 的形状是 (3,1) 或 (3,)
-                t_vec = pose['t'].reshape(3,)
-                T[:3, 3] = t_vec
-                camera_matrices.append(T)
 
             # 5.2 从 point_observations 构建观测数组
             observations, point_indices, camera_indices = [], [], []
@@ -483,11 +341,11 @@ if __name__ == "__main__":
         feature_matcher=True,
         initial_pose_estimator=True,
         pnp_estimator=True,
-        bundle_adjustment=True,
+        bundle_adjustment=False,
         verbose= False,
         save=False,
         load=True
     )
-    pipeline.run()
+    # pipeline.run()
     pipeline.visualize_from_output()  # 可视化输出结果
 

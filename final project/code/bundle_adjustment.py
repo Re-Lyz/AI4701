@@ -12,10 +12,169 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import logging
 import open3d as o3d
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+class BundleAdjustmentInterface:
+    """
+    Bundle Adjustment 基类接口，定义统一的构造与 optimize 方法
+    """
+    def __init__(self, camera_intrinsics: np.ndarray, verbose: bool = True):
+        self.K = camera_intrinsics
+        self.verbose = verbose
+
+    def optimize(
+        self,
+        cameras: np.ndarray,
+        points_3d: np.ndarray,
+        observations: np.ndarray,
+        point_indices: np.ndarray,
+        camera_indices: np.ndarray
+    ):
+        """
+        统一接口：
+        Args:
+            cameras: 初始相机位姿 np.ndarray [N_cameras×4×4]
+            points_3d: 初始3D点坐标 np.ndarray [N_points×3]
+            observations: 观测2D坐标 np.ndarray [N_obs×2]
+            point_indices: 每个观测对应的3D点索引 np.ndarray [N_obs]
+            camera_indices: 每个观测对应的相机索引 np.ndarray [N_obs]
+        Returns:
+            optimized_cameras: 优化后相机位姿 [N_cameras×4×4]
+            optimized_points_3d: 优化后3D点 [N_points×3]
+            info: dict 优化信息
+        """
+        raise NotImplementedError
+
+
+class TorchBundleAdjustment(nn.Module):
+    """基于 PyTorch 可微分的 Bundle Adjustment，带调试输出"""
+    def __init__(
+        self,
+        camera_intrinsics: np.ndarray,
+        init_cameras: np.ndarray,
+        init_points: np.ndarray,
+        verbose: bool = True
+    ):
+        super().__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.K_tensor = torch.from_numpy(camera_intrinsics).float().to(self.device)
+        # 初始化 cams 和 points
+        cams_param = []
+        N_cam = init_cameras.shape[0]
+        for i in range(N_cam):
+            T = init_cameras[i]
+            R = T[:3,:3]
+            t = T[:3,3]
+            rvec,_ = cv2.Rodrigues(R)
+            cams_param.append(np.hstack([rvec.flatten(), t]))
+        self.cams = nn.Parameter(torch.tensor(cams_param, dtype=torch.float32, device=self.device))
+        self.points = nn.Parameter(torch.tensor(init_points, dtype=torch.float32, device=self.device))
+        self.verbose = verbose
+
+    def rodrigues(self, rvecs):
+        if self.verbose:
+            print(f"[rodrigues] input rvecs shape: {rvecs.shape}")
+        theta = torch.norm(rvecs, dim=1, keepdim=True)
+        axis = rvecs / (theta + 1e-8)
+        cos_t = torch.cos(theta)[..., None]
+        sin_t = torch.sin(theta)[..., None]
+        K = torch.zeros((rvecs.shape[0],3,3), device=self.device)
+        ax = axis
+        K[:,0,1] = -ax[:,2]; K[:,0,2] = ax[:,1]
+        K[:,1,0] = ax[:,2];  K[:,1,2] = -ax[:,0]
+        K[:,2,0] = -ax[:,1]; K[:,2,1] = ax[:,0]
+        I = torch.eye(3, device=self.device).unsqueeze(0)
+        R = I*cos_t + (1-cos_t)*(axis.unsqueeze(-1)@axis.unsqueeze(-2)) + sin_t*K
+        if self.verbose:
+            print(f"[rodrigues] output R shape: {R.shape}")
+        return R
+
+    def forward(self, obs_uv, cam_idx, pt_idx):
+        cams = self.cams[cam_idx]
+        rvec = cams[:,:3]
+        tvec = cams[:,3:6]
+        R = self.rodrigues(rvec)
+        pts = self.points[pt_idx]
+        Xc = torch.bmm(R, pts.unsqueeze(-1)).squeeze(-1) + tvec
+        uv = Xc / Xc[:,2:3]
+        fx, fy = self.K_tensor[0,0], self.K_tensor[1,1]
+        cx, cy = self.K_tensor[0,2], self.K_tensor[1,2]
+        u = fx*uv[:,0] + cx
+        v = fy*uv[:,1] + cy
+        pred_uv = torch.stack([u,v], dim=1)
+        if self.verbose:
+            print(f"[forward] batch obs_uv shape: {obs_uv.shape}, pred_uv shape: {pred_uv.shape}")
+            print(f"[forward] sample obs_uv: {obs_uv[:3].cpu().numpy()}, pred_uv: {pred_uv[:3].detach().cpu().numpy()}")
+        return pred_uv
+
+    def optimize(
+        self,
+        cameras: np.ndarray,
+        points_3d: np.ndarray,
+        observations: np.ndarray,
+        point_indices: np.ndarray,
+        camera_indices: np.ndarray,
+        batch_size: int = 128
+    ):
+        # 准备数据
+        obs = torch.tensor(observations, dtype=torch.float32, device=self.device)
+        cam_idx = torch.tensor(camera_indices, dtype=torch.long, device=self.device)
+        pt_idx  = torch.tensor(point_indices,  dtype=torch.long, device=self.device)
+        dataset = TensorDataset(obs, cam_idx, pt_idx)
+        loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        # Adam 粗调
+        adam = optim.Adam(self.parameters(), lr=1e-3)
+        for epoch in range(10):
+            epoch_loss = 0.0
+            for batch_obs, batch_cam, batch_pt in loader:
+                adam.zero_grad()
+                pred_uv = self(batch_obs, batch_cam, batch_pt)
+                loss    = (pred_uv - batch_obs).pow(2).sum()
+                loss.backward()
+                adam.step()
+                epoch_loss += loss.item()
+            if self.verbose:
+                print(f"[optimize][Adam] epoch {epoch+1}/10, loss = {epoch_loss:.4f}")
+
+        # LBFGS 精调
+        if self.verbose:
+            print("[optimize] Starting LBFGS refinement...")
+        lbfgs = optim.LBFGS(self.parameters(), max_iter=50)
+        def closure():
+            lbfgs.zero_grad()
+            pred_uv_full = self(obs, cam_idx, pt_idx)
+            loss_full    = (pred_uv_full - obs).pow(2).sum()
+            loss_full.backward()
+            if self.verbose:
+                print(f"[optimize][LBFGS] current loss = {loss_full.item():.4f}")
+            return loss_full
+        lbfgs.step(closure)
+
+        # 导出结果
+        cams_opt = self.cams.detach().cpu().numpy()
+        pts_opt  = self.points.detach().cpu().numpy()
+        optimized_cams = []
+        for r_t in cams_opt:
+            rvec, t = r_t[:3], r_t[3:6]
+            R,_ = cv2.Rodrigues(rvec)
+            T = np.eye(4)
+            T[:3,:3] = R
+            T[:3,3] = t
+            optimized_cams.append(T)
+
+        if self.verbose:
+            print(f"[optimize] Completed optimization. cams_opt shape: {cams_opt.shape}, points shape: {pts_opt.shape}")
+        info = {'success': True, 'method': 'torch'}
+        return np.stack(optimized_cams), pts_opt, info
+
 
 class BundleAdjustment:
     """Bundle Adjustment优化器类"""
@@ -209,203 +368,130 @@ class BundleAdjustment:
 
 if __name__ == "__main__":
     from feature_extraction import extract_features_from_images
-    from feature_matching import match_image_pairs,match_sift_features,filter_matches_by_homography
+    from feature_matching import match_sift_features, filter_two_view_geometry
     from initial_recon import estimate_pose, print_pose_info
-    from pnp_recon import pnp_pose, triangulate_initial_points,visualize_with_open3d
-    
-    # Test image paths
-    image_paths = [
-        "images/DJI_20200223_163016_842.jpg",
-        "images/DJI_20200223_163017_967.jpg",
-        "images/DJI_20200223_163018_942.jpg",
-        "images/DJI_20200223_163019_752.jpg",
-        "images/DJI_20200223_163020_712.jpg",
-        "images/DJI_20200223_163021_627.jpg",
-        "images/DJI_20200223_163022_557.jpg",
-        "images/DJI_20200223_163023_427.jpg", 
-    ]
-    
-    # Check if test images exist
-    test_images_exist = all(os.path.exists(path) for path in image_paths)
-    
-    if not test_images_exist:
-        print("Test images not found. Creating dummy test images...")
-        # Create dummy test images with overlapping features
-        for i, path in enumerate(image_paths):
-            # Create images with some common features for matching
-            img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-            
-            # Add some common geometric patterns
-            cv2.rectangle(img, (100, 100), (200, 200), (255, 255, 255), -1)
-            cv2.circle(img, (300, 200), 40, (0, 0, 255), -1)
-            cv2.line(img, (50, 300), (550, 300), (0, 255, 0), 3)
-            
-            # Add some unique features per image
-            cv2.rectangle(img, (50+i*100, 50), (100+i*100, 100), (255, 0, 255), -1)
-            cv2.circle(img, (400+i*50, 350), 25, (255, 255, 0), -1)
-            
-            cv2.imwrite(path, img)
-        print("Test images created successfully!")
-        
-    print("\n" + "="*60)
-    print("EXTRACTING FEATURES FOR MATCHING TEST")
-    print("="*60)
-    
-    sift_features = extract_features_from_images(image_paths, method='sift')
+    from pnp_recon import pnp_pose, triangulate_points
 
-    print("\n" + "="*60)
-    print("MATCHING FEATURES BETWEEN TEST IMAGES")
-    print("="*60)
-    
-    sift_matches = match_image_pairs(sift_features, method='sift')    
-    
-    if len(sift_features) >= 2:
-        kp1, desc1 = sift_features[0]
-        kp2, desc2 = sift_features[1]
-        
-        if desc1 is not None and desc2 is not None:
-            print(f"\n--- Detailed analysis of pair (1, 2) ---")
-            matches_1_2 = match_sift_features(desc1, desc2)
-            
-            # Apply homography filtering
-            if len(matches_1_2) >= 4:
-                filtered_matches_01, H01 = filter_matches_by_homography(kp1, kp2, matches_1_2)
-                print(f"Filtered matches after homography: {len(filtered_matches_01)}")
-                K_txt_path = "camera_intrinsic.txt"
-                if not os.path.exists(K_txt_path):
-                    raise FileNotFoundError(f"找不到相机内参文件：{K_txt_path}")
-                K = np.loadtxt(K_txt_path, dtype=np.float32)
-                if K.shape != (3, 3):
-                    raise ValueError(f"读取到的相机内参矩阵形状不正确，应为 3x3，但得到 {K.shape}")
-                
-                # 估计相对位姿
-                R, t, mask_pose, E, inlier_matches = estimate_pose(filtered_matches_01, kp1, kp2, K)
-                
-                # 打印位姿信息
-                num_matches = len(filtered_matches_01)
-                num_inliers = len(inlier_matches)
-                print_pose_info(R, t, num_matches, num_inliers)
-    R01, t01, mask_pose, E01, inlier_matches_01 = estimate_pose(filtered_matches_01, kp1, kp2, K)
-    num_matches = len(filtered_matches_01)
-    num_inliers = len(inlier_matches_01)
-    print_pose_info(R01, t01, num_matches, num_inliers)
+    image_folder = 'images'
+    paths = []
 
-    # 6. 三角化得到初始三维点
-    print("\nTriangulating initial 3D points...")
-    initial_3d_points, valid_indices = triangulate_initial_points(inlier_matches_01, kp1, kp2, K, R01, t01)
-    print(f"Triangulated {len(initial_3d_points)} initial 3D points")
+    # 1. 遍历、收集
+    for root, dirs, files in os.walk(image_folder):
+        for f in sorted(files):
+            if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                paths.append(os.path.join(root, f))
 
-    # 7. 构建初始的 camera_poses 列表 & point_observations 字典
+    # 2. 找到目标（不含后缀）  
+    target_stem = 'DJI_20200223_163225_243'
+    # 注意：如果有不同后缀（.jpg/.png），就只比对 stem
+    target_path = next(
+        (p for p in paths if os.path.splitext(os.path.basename(p))[0] == target_stem),
+        None
+    )
+
+    # 3. 如果找到，就先移除再插入到最前面
+    if target_path:
+        paths.remove(target_path)
+        paths.insert(0, target_path)
+
+    image_paths = paths
+
+    
+    os.makedirs("images", exist_ok=True)
+    for path in image_paths:
+        if not os.path.exists(path):
+            img = np.random.randint(0,255,(480,640,3),dtype=np.uint8)
+            cv2.rectangle(img,(100,100),(200,200),(255,255,255),-1)
+            cv2.circle(img,(300,200),40,(0,0,255),-1)
+            cv2.line(img,(50,300),(550,300),(0,255,0),3)
+            cv2.imwrite(path,img)
+
+    # Load intrinsics
+    K = np.loadtxt("camera_intrinsic.txt", dtype=np.float64)
+
+    # 1. Extract and match features for first two
+    kp1, desc1 = extract_features_from_images([image_paths[0]], method='sift')[0]
+    kp2, desc2 = extract_features_from_images([image_paths[1]], method='sift')[0]
+    matches_1_2 = match_sift_features(desc1, desc2)
+    inliers_01, _ = filter_two_view_geometry(kp1, kp2, matches_1_2, K)
+    R01, t01, _, _, inlier_matches_01 = estimate_pose(inliers_01, kp1, kp2, K)
+    print_pose_info(R01, t01, len(inliers_01), len(inlier_matches_01))
+
+    # 2. Triangulate initial points
+    initial_3d_points, valid_indices = triangulate_points(
+        inlier_matches_01, kp1, kp2, K,
+        R1=np.eye(3), t1=np.zeros((3,1)), R2=R01, t2=t01
+    )
+    print(f"Triangulated {len(initial_3d_points)} points")
+
+    # 3. Initialize poses and observations
     camera_poses = [
-        {'R': np.eye(3),    't': np.zeros((3,1)),    'image': os.path.basename(image_paths[0])},
-        {'R': R01,          't': t01,                'image': os.path.basename(image_paths[1])}
+        {'R': np.eye(3), 't': np.zeros((3,1))},
+        {'R': R01,       't': t01}
     ]
-    scene_points_3d = initial_3d_points.copy()
+    scene_points_3d = initial_3d_points.tolist()
     point_observations = {}
-    # 对每个三角化的点，记录它在相机 0/1 中的像素观测
-    for idx_pt3d, idx_match in enumerate(valid_indices):
-        # 通过 idx_match 找到对应的 match 对象
-        m = inlier_matches_01[idx_match]
-        pt0 = kp1[m.queryIdx].pt  # 相机 0 的像素坐标
-        pt1 = kp2[m.trainIdx].pt  # 相机 1 的像素坐标
-        point_observations[idx_pt3d] = {0: pt0, 1: pt1}
+    for local_idx, g_idx in enumerate(valid_indices):
+        m = inlier_matches_01[g_idx]
+        point_observations[local_idx] = {
+            0: tuple(kp1[m.queryIdx].pt),
+            1: tuple(kp2[m.trainIdx].pt)
+        }
 
-    # 8. 递增式地对后续图像使用 PnP 恢复相机位姿
-    num_images = 3   # 假设我们有 3 张图：0,1,2
-    for img_idx in range(2, num_images):
-        img_name = os.path.basename(image_paths[img_idx])
-        print(f"\nProcessing PnP for image {img_idx}: {img_name}")
-
-        # 提取第 img_idx 张图的特征（假设你已经提前生成过，或者在此处直接调用）
-        # 这里用 extract_features_from_images 对 image_paths[img_idx] 单独提取
-        kp_new, desc_new = extract_features_from_images([image_paths[img_idx]], method="sift")[0]
-
-        # 0 ↔ img_idx 的匹配（假设你可以直接调用 match_sift_features）
-        matches_0_i = match_sift_features(desc1, desc_new)  # desc1=第0张图的描述子
-        if len(matches_0_i) < 6:
-            print(f"  - 匹配点太少（{len(matches_0_i)}），跳过此张图")
-            continue
-        
-        # 从 matches_0_i 中筛选那些在 point_observations 中已有三维点的对应
-        image_points = []
-        object_points = []
+    # 4. Incremental PnP
+    for img_idx in range(2, len(image_paths)):
+        kp_new, desc_new = extract_features_from_images([image_paths[img_idx]], method='sift')[0]
+        matches_0_i = match_sift_features(desc1, desc_new)
+        image_pts, obj_pts, obj_ids = [], [], []
         for m in matches_0_i:
-            idx0 = m.queryIdx   # 第0张图中 keypoint 索引
-            idx_new = m.trainIdx  # 新图中 keypoint 索引
-            
-            # 遍历 point_observations，看第0张图的第 idx0 个 keypoint 是否属于某个三维点
-            for pt3d_idx, obs_dict in point_observations.items():
-                if 0 in obs_dict:
-                    if np.linalg.norm(np.array(obs_dict[0]) - np.array(kp1[idx0].pt)) < 1.5:
-                        # 找到了一个已有的三维点，可以作为 2D→3D 对应
-                        image_points.append(kp_new[idx_new].pt)
-                        object_points.append(scene_points_3d[pt3d_idx])
-                        break
-        
-        print(f"  - 找到 {len(object_points)} 对2D-3D 对应，用于 PnP")
-        if len(object_points) < 6:
-            print("  - 2D-3D 对应不足 6，跳过 PnP")
+            for pid, obs in point_observations.items():
+                if np.linalg.norm(np.array(obs[0]) - np.array(kp1[m.queryIdx].pt))<1.5:
+                    image_pts.append(kp_new[m.trainIdx].pt)
+                    obj_pts.append(scene_points_3d[pid])
+                    obj_ids.append(pid)
+                    break
+        if len(obj_pts)<6:
             continue
-        
-        # 调用 PnP 求解新相机位姿
-        try:
-            R_new, t_new, inliers_new = pnp_pose(image_points, object_points, K)
-            print(f"  - PnP 成功：{len(inliers_new)} 个内点 / 共 {len(object_points)} 对对应")
-            camera_poses.append({'R': R_new, 't': t_new, 'image': img_name})
-        except Exception as e:
-            print(f"  - PnP 求解失败：{e}")
-            continue
-    # -----------------------
-    # ——— 2. 准备 BA 数据并调用优化 ———
-    # -----------------------
+        Rn, tn, inls = pnp_pose(image_pts, obj_pts, K)
+        camera_poses.append({'R': Rn, 't': tn})
+        inls = inls.flatten()  
+        for idx in inls:
+            pid = obj_ids[idx]
+            point_observations[pid][img_idx] = tuple(image_pts[idx])
 
-    # 2.1 构建 BA 所需的观测列表：observations, point_indices, camera_indices
-    #     我们对每个三维点，查它在哪些相机里有观测，把每条观测当成一条记录
-    obs_list = []        # 存放所有 2D 观测点 (u,v)
-    pt_idx_list = []     # 对应的三维点索引 idx
-    cam_idx_list = []    # 对应的相机索引 idx
+    # 5. Prepare BA inputs
+    obs_list, pidx_list, cidx_list = [],[],[]
+    for pid, obs in point_observations.items():
+        for cid, uv in obs.items():
+            obs_list.append(uv)
+            pidx_list.append(pid)
+            cidx_list.append(cid)
+    observations   = np.array(obs_list)
+    point_indices  = np.array(pidx_list)
+    camera_indices = np.array(cidx_list)
 
-    n_cams = len(camera_poses)
-    n_pts  = scene_points_3d.shape[0]
-
-    # 遍历每一个三维点 (pt3d_idx)，它的观测在 point_observations[pt3d_idx] 里
-    for pt3d_idx, cam_dict in point_observations.items():
-        for cam_idx, uv in cam_dict.items():
-            # cam_idx 一定 < n_cams
-            if cam_idx >= n_cams:
-                continue
-            obs_list.append([uv[0], uv[1]])
-            pt_idx_list.append(pt3d_idx)
-            cam_idx_list.append(cam_idx)
-
-    observations   = np.array(obs_list, dtype=np.float64)       # K×2
-    point_indices  = np.array(pt_idx_list, dtype=np.int32)      # 长度 K
-    camera_indices = np.array(cam_idx_list, dtype=np.int32)     # 长度 K
-
-    print("\n=== Bundle Adjustment 输入信息 ===")
-    print(f"  相机数: {n_cams}")
-    print(f"  三维点数: {n_pts}")
-    print(f"  观测数: {observations.shape[0]}")
-
-    # 2.2 构造相机姿态矩阵列表：4×4 矩阵
     cam_transforms = []
     for cam in camera_poses:
-        R_mat = cam['R']
-        t_vec = cam['t'].reshape(3)
-        T = np.eye(4, dtype=np.float64)
-        T[:3, :3] = R_mat
-        T[:3, 3] = t_vec
+        T = np.eye(4)
+        T[:3,:3] = cam['R']
+        T[:3,3]  = cam['t'].reshape(-1)
         cam_transforms.append(T)
+    init_cams = np.stack(cam_transforms)
+    pts_arr   = np.array(scene_points_3d)
 
-    # 2.3 调用 Bundle Adjustment 优化
-    ba = BundleAdjustment(camera_intrinsics=K, verbose=True)
-    optimized_cams, optimized_pts3d, ba_info = ba.optimize(
-        cameras=cam_transforms,
-        points_3d=scene_points_3d,
+    # 6. Bundle Adjustment
+    ba = TorchBundleAdjustment(camera_intrinsics=K,
+                                init_cameras=init_cams,
+                                init_points = pts_arr)
+    optimized_cams, optimized_pts3d, info = ba.optimize(
+        cameras=init_cams,
+        points_3d=pts_arr,
         observations=observations,
         point_indices=point_indices,
         camera_indices=camera_indices
     )
+
+    print("BA Optimization Info:", info)
 
     # -----------------------
     # ——— 3. 保存 & 可视化 BA 结果 ———
@@ -488,7 +574,7 @@ if __name__ == "__main__":
     with open(info_path, 'w') as f:
         f.write("Bundle Adjustment Optimization Info\n")
         f.write("="*40 + "\n")
-        for k,v in ba_info.items():
+        for k,v in info.items():
             f.write(f"{k}: {v}\n")
     print(f"[INFO] Saved BA optimization info to: {info_path}")
 

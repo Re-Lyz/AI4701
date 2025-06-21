@@ -5,6 +5,41 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from typing import List, Tuple, Optional
+
+def pick_first_pair(
+    matches: List[List[List[cv2.DMatch]]],
+    features: List[Tuple[List[cv2.KeyPoint], np.ndarray]],
+    K: np.ndarray
+) -> Tuple[int, int, np.ndarray, np.ndarray, List[cv2.DMatch]]:
+    """
+    选取前两幅图（0 和 1）做初始化：
+      - matches: 二维列表，matches[i][j] 存的是 i->j 的 match 列表
+      - features: 每幅图的 (keypoints, descriptors)
+      - K: 相机内参矩阵
+
+    返回:
+      init_i, init_j: 用作初始化的两张图的索引（这里固定是 0, 1）
+      R0, t0: 相对位姿
+      init_inliers: 被认为是 inlier 的 cv2.DMatch 列表
+    """
+    # 1. 指定索引
+    init_i, init_j = 0, 5
+
+    # 2. 取出它们的 matches 和 keypoints
+    matches01 = matches[init_i][init_j]
+    kp1, _ = features[init_i]
+    kp2, _ = features[init_j]
+
+    # 3. 调用 estimate_pose
+    R0, t0, mask_pose, E, init_inliers = estimate_pose(matches01, kp1, kp2, K)
+
+    # 4. 可选：打印信息
+    num_matches = len(matches01)
+    num_inliers = len(init_inliers)
+    print_pose_info(R0, t0, num_matches, num_inliers)
+
+    return init_i, init_j, R0, t0, init_inliers
 
 def estimate_pose(matches, kp1, kp2, K):
     """
@@ -202,6 +237,146 @@ def visualize_epipolar_geometry(img1_path, img2_path, kp1, kp2, inlier_matches, 
         
     except Exception as e:
         print(f"Could not create epipolar geometry visualization: {e}")
+
+def pick_initial_pair(
+    K: np.ndarray,
+    al_matches: List[List[List[cv2.DMatch]]],
+    keypoints: List[List[cv2.KeyPoint]],
+    min_inliers: int = 15,
+    min_triangulated: int = 50,
+    min_tri_angle_deg: float = 1.5,
+    reproj_error_thresh: float = 4.0,
+    plane_ratio_thresh: float = 0.8,
+    fixed_world_idx: Optional[int] = None
+) -> Tuple[int, int, np.ndarray, np.ndarray, List[cv2.DMatch]]:
+    """
+    按 COLMAP 思路挑选初始化图像对：
+      1) E vs H 退化检测
+      2) recoverPose + cheirality & reprojection & 三角化角度过滤
+      3) 排序: num_triangulated -> avg_angle -> n_inliers
+
+    Args:
+        K: 相机内参
+        al_matches: N×N 匹配矩阵
+        keypoints: 每张图的关键点列表
+        min_inliers: 最小 recoverPose 内点
+        min_triangulated: 最小可三角化稳定点数
+        min_tri_angle_deg: 最小平均三角化角度 (°)
+        reproj_error_thresh: 最大重投影误差 (px)
+        plane_ratio_thresh: H/E 比例最大值，防止平面退化
+
+    Returns:
+        best_i, best_j, best_R, best_t, best_inliers
+    """
+    num_images = len(al_matches)
+    best_score = (0, 0.0, 0)  # (num_tri, avg_angle, n_inliers)
+    best_i = best_j = -1
+    best_R = np.eye(3)
+    best_t = np.zeros((3,1))
+    best_inliers: List[cv2.DMatch] = []
+
+    for i in range(num_images):
+        for j in range(i+1, num_images):
+            matches_ij = al_matches[i][j]
+            if len(matches_ij) < min_inliers:
+                continue
+
+            pts1 = np.array([keypoints[i][m.queryIdx].pt for m in matches_ij])
+            pts2 = np.array([keypoints[j][m.trainIdx].pt for m in matches_ij])
+
+            # 1) 本质矩阵 & 单应矩阵 --> 平面退化检测
+            E, mask_E = cv2.findEssentialMat(pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+            H, mask_H = cv2.findHomography(pts1, pts2, cv2.RANSAC, ransacReprojThreshold=1.0)
+            if mask_E is None or mask_H is None:
+                continue
+            in_E = mask_E.ravel().astype(bool).sum()
+            in_H = mask_H.ravel().astype(bool).sum()
+            if in_H > plane_ratio_thresh * in_E:
+                continue
+
+            # 2) recoverPose
+            _, R, t, mask_pose = cv2.recoverPose(E, pts1, pts2, K, mask=mask_E)
+            pose_mask = mask_pose.ravel().astype(bool)
+            n_inliers = pose_mask.sum()
+            if n_inliers < min_inliers:
+                continue
+
+            inlier_pts1 = pts1[pose_mask]
+            inlier_pts2 = pts2[pose_mask]
+
+            # 3) 三角化验证: cheirality, reprojection & 三角化角度
+            num_tri, avg_angle = compute_parallax(
+                inlier_pts1, inlier_pts2, R, t, K, reproj_error_thresh
+            )
+            if num_tri < min_triangulated:
+                continue
+            if avg_angle < np.deg2rad(min_tri_angle_deg):
+                continue
+
+            # 4) 更新最优: 按 (num_tri, avg_angle, n_inliers)
+            score = (num_tri, avg_angle, n_inliers)
+            if score > best_score:
+                best_score = score
+                best_i, best_j = i, j
+                best_R, best_t = R, t
+                # 内点匹配按 pose_mask 过滤
+                best_inliers = [m for m, ok in zip(matches_ij, pose_mask) if ok]
+
+    if best_score[0] == 0:
+        raise RuntimeError(
+            "没有找到满足条件的初始图像对，请降低阈值或检查匹配质量。"
+        )
+
+    return best_i, best_j, best_R, best_t, best_inliers
+
+def compute_parallax(
+    pts1: np.ndarray,
+    pts2: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    K: np.ndarray,
+    reproj_error_thresh: float = 4.0
+) -> Tuple[int, float]:
+    """
+    三角化 pts1-pts2, 并进行
+      - 深度正性 (cheirality)
+      - 重投影误差 (reproj_error_thresh px)
+    统计满足条件的点数及平均视差角。
+
+    Returns:
+        num_valid, avg_angle (rad)
+    """
+    # 构建投影矩阵 P1, P2
+    P1 = K @ np.hstack((np.eye(3), np.zeros((3,1))))
+    P2 = K @ np.hstack((R, t))
+
+    # 三角化 (4×N)
+    pts4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
+    pts4d /= pts4d[3:4]
+    pts3d = pts4d[:3].T
+
+    # 投影 & 误差
+    proj1 = (P1 @ pts4d).T
+    proj1 = proj1[:, :2] / proj1[:, 2:3]
+    proj2 = (P2 @ pts4d).T
+    proj2 = proj2[:, :2] / proj2[:, 2:3]
+    err1 = np.linalg.norm(proj1 - pts1, axis=1)
+    err2 = np.linalg.norm(proj2 - pts2, axis=1)
+
+    # depth cheirality
+    cam2_pts = (R @ pts3d.T + t).T
+    valid = (pts3d[:,2] > 0) & (cam2_pts[:,2] > 0)
+    valid &= (err1 < reproj_error_thresh) & (err2 < reproj_error_thresh)
+    if not valid.any():
+        return 0, 0.0
+
+    # 视差角
+    v1 = pts3d[valid] / np.linalg.norm(pts3d[valid], axis=1, keepdims=True)
+    v2 = cam2_pts[valid] / np.linalg.norm(cam2_pts[valid], axis=1, keepdims=True)
+    cosang = np.sum(v1 * v2, axis=1)
+    cosang = np.clip(cosang, -1.0, 1.0)
+    angles = np.arccos(cosang)
+    return int(valid.sum()), float(np.mean(angles))
 
 
 if __name__ == "__main__":

@@ -1,8 +1,0 @@
-Bundle Adjustment Optimization Info
-========================================
-success: True
-initial_cost: 0.011243660641000686
-final_cost: 0.00706785066973354
-cost_reduction: 0.004175809971267146
-iterations: 39
-message: `ftol` termination condition is satisfied.

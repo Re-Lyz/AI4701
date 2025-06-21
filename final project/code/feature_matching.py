@@ -300,7 +300,6 @@ def match_image_pairs_save(
 
     return raw_matches
 
-
 def load_or_match_image_pairs(
     feature_data: List[Tuple[List[cv2.KeyPoint], Optional[np.ndarray]]],
     method: str = 'sift',
@@ -358,8 +357,6 @@ def load_or_match_image_pairs(
         output_dir=output_dir, filename=filename
     )
 
-
-
 def filter_matches_by_homography(kp1: List, kp2: List, matches: List, 
                                 ransac_threshold: float = 5.0) -> Tuple[List, Optional[np.ndarray]]:
     """
@@ -397,6 +394,61 @@ def filter_matches_by_homography(kp1: List, kp2: List, matches: List,
     except Exception as e:
         print(f"Error in homography estimation: {e}")
         return matches, None
+
+def filter_two_view_geometry(
+    kp1, kp2, matches,
+    K,
+    min_inliers=15,
+    e_ransac_thresh=1.0,
+    reproj_error_thresh=4.0,
+    plane_ratio_thresh=0.8
+):
+    # 1) 本质矩阵 RANSAC
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1,1,2)
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1,1,2)
+    E, mask_E = cv2.findEssentialMat(
+        pts1, pts2, K,
+        method=cv2.RANSAC,
+        prob=0.999,
+        threshold=e_ransac_thresh
+    )
+    if mask_E is None:
+        print(f"[Geo] findEssentialMat failed, matches={len(matches)}")
+        return [], None
+    nE = int(mask_E.sum())
+    print(f"[Geo] E-inliers: {nE}/{len(matches)}")
+    if nE < min_inliers:
+        print(f"[Geo] rejected by min_inliers={min_inliers}")
+        return [], None
+
+    # 2) 单应矩阵 RANSAC（退化检测）
+    H, mask_H = cv2.findHomography(pts1, pts2, cv2.RANSAC, ransacReprojThreshold=e_ransac_thresh)
+    if mask_H is not None:
+        nH = int(mask_H.ravel().sum())
+        ratio = nH / nE
+        print(f"[Geo] H-inliers: {nH}/{nE}  ratio={ratio:.2f}")
+        if ratio > plane_ratio_thresh:
+            print(f"[Geo] rejected by plane_ratio_thresh={plane_ratio_thresh}")
+            return [], None
+
+    # 3) 基于 E 的内点，recoverPose 得到更严格的 mask_pose
+    _, R, t, mask_pose = cv2.recoverPose(E, pts1, pts2, K, mask=mask_E)
+    pose_mask = mask_pose.ravel().astype(bool)
+    nPose = int(pose_mask.sum())
+    print(f"[Geo] Pose-inliers: {nPose}/{nE}")
+    if nPose < min_inliers:
+        print(f"[Geo] rejected by min_inliers after recoverPose")
+        return [], None
+
+    # 4) （可选）三角化 & 重投影剔除
+    #    这里先打印一下，还没实现时只记录 pose 内点
+    #    如果启用 triangulatePoints，可在此插入真正的三角化过滤
+
+    # 5) 最终 inliers
+    inlier_matches = [m for m, ok in zip(matches, pose_mask) if ok]
+    print(f"[Geo] final inliers: {len(inlier_matches)}")
+    return inlier_matches, E
+
 
 if __name__ == "__main__":
     # Import the feature extraction module
