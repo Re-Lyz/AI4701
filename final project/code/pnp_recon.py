@@ -4,6 +4,46 @@ import os
 import open3d as o3d
 from typing import List, Tuple,Dict
 
+def register_frame_by_epipolar(prev_idx: int,
+                               curr_idx: int,
+                               al_matches: List[List[List[cv2.DMatch]]],
+                               features: List[Tuple[List[cv2.KeyPoint], np.ndarray]],
+                               K: np.ndarray):
+    """
+    用预先过滤后的 al_matches[prev_idx][curr_idx]（2D–2D inliers）
+    来做 Essential Matrix 分解，估计 R, t, 并返回 inlier mask。
+    """
+    # 1. 取出已经 RANSAC 过的 2D–2D matches
+    matches = al_matches[prev_idx][curr_idx]
+    if len(matches) < 8:
+        return None, None, None
+
+    # 2. 提取两帧上的像素坐标对
+    kp_prev, _ = features[prev_idx]
+    kp_curr, _ = features[curr_idx]
+    pts_prev = np.float32([ kp_prev[m.queryIdx].pt for m in matches ])  # (N,2)
+    pts_curr = np.float32([ kp_curr[m.trainIdx].pt  for m in matches ])  # (N,2)
+
+    # 3. 估计 Essential Matrix + inlier mask
+    E, mask = cv2.findEssentialMat(
+        pts_prev, pts_curr, K,
+        method=cv2.RANSAC,
+        prob=0.999,
+        threshold=1.0
+    )
+    if E is None or mask is None:
+        return None, None, None
+
+    # 4. 从 E 分解出 R, t
+    _, R, t, mask_pose = cv2.recoverPose(
+        E, pts_prev, pts_curr, K,
+        mask=mask
+    )
+    # mask_pose: N×1，1 表示 inlier
+    inlier_mask = mask_pose.ravel().astype(bool)
+
+    return R, t, inlier_mask
+
 
 def pnp_pose(image_points, object_points, K):
     """
@@ -106,6 +146,10 @@ def multi_view_triangulation(
     pid_start = max(points_3d.keys(), default=-1) + 1
 
     for a in anchor_idxs:
+        matches_an = al_matches[a][new_idx]
+        if len(matches_an) == 0:
+            # 没有匹配就跳过
+            continue        
         kp_a, _ = features[a]
         kp_n, _ = features[new_idx]
         matches_an = al_matches[a][new_idx]
@@ -113,11 +157,15 @@ def multi_view_triangulation(
         R_a, t_a = camera_poses[a]['R'], camera_poses[a]['t']
         R_n, t_n = camera_poses[new_idx]['R'], camera_poses[new_idx]['t']
 
-        P1 = K @ np.hstack([R_a, t_a])
-        P2 = K @ np.hstack([R_n, t_n])
+        P1 = K.astype(np.float32) @ np.hstack([R_a, t_a])
+        P2 = K.astype(np.float32) @ np.hstack([R_n, t_n])
 
         pts1 = np.float32([kp_a[m.queryIdx].pt for m in matches_an]).T
         pts2 = np.float32([kp_n[m.trainIdx].pt for m in matches_an]).T
+        if pts1.shape[1] == 0:
+            # 没有匹配点就跳过
+            continue
+        
         X4 = cv2.triangulatePoints(P1, P2, pts1, pts2)
         X3 = (X4[:3] / X4[3]).T
 
@@ -235,7 +283,7 @@ def visualize_with_open3d(
     ctr.set_lookat(lookat.tolist())  # 转换为list
     ctr.set_front(front.tolist())
     ctr.set_up(up.tolist())
-    ctr.set_zoom(0.1)
+    ctr.set_zoom(0.3)
 
     vis.run()
     vis.destroy_window()
@@ -247,7 +295,7 @@ def visualize_colored_point_cloud(
     K: np.ndarray,              # 相机内参矩阵 (3,3)
     color_cam_idx: int = 0,        # 用第几台相机的图像做取色
     bg_color=(1,1,1),
-    zoom: float = 0.8
+    zoom: float = 0.3
 ):
     """
     可视化带颜色的稀疏点云：

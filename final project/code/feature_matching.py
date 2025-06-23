@@ -307,7 +307,7 @@ def load_or_match_image_pairs(
     save: bool = False,
     output_dir: Optional[str] = None,
     filename: str = "all_matches.yml"
-) -> List[List[List[cv2.DMatch]]]:
+    ) -> List[List[List[cv2.DMatch]]]:
     """
     load=True 时若 output_dir/filename 存在，则用 FileStorage 加载并重建 DMatch；
     否则重新匹配并（可选）用 FileStorage 保存。

@@ -244,7 +244,7 @@ def _apply_rootsift_normalization(descriptors: np.ndarray) -> np.ndarray:
 
 def extract_sift_features_improved(
     image_path: str,
-    max_features: int = 8192,
+    max_features: int = 16384,
     grid_size: int = 4
 ) -> Tuple[List[cv2.KeyPoint], Optional[np.ndarray]]:
     """
@@ -620,8 +620,6 @@ if __name__ == "__main__":
     # Example image paths (replace with your actual image paths)
     image_paths = [
         "images/DJI_20200223_163016_842.jpg",
-        "images/DJI_20200223_163017_967.jpg",
-        "images/DJI_20200223_163018_942.jpg" 
     ]
     
     # Check if test images exist, if not create dummy ones for testing
@@ -645,8 +643,8 @@ if __name__ == "__main__":
     print("Testing SIFT Feature Extraction")
     print("="*50)
     
+    # sift_features = extract_features_from_images(image_paths, method='sift')
     sift_features = extract_features_from_images(image_paths, method='sift_colmap')
-        
     
     # Display keypoints for the first 5 images
     display_keypoints_for_images(image_paths, sift_features, max_images=5, save_visualizations=False)
